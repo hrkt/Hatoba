@@ -1,0 +1,712 @@
+#!/usr/bin/env python3
+# board_daemon.py -- 実機ボード操作デーモン (WSL2 側で動く本体)
+#
+# 役割:
+#   離れたマシンのエージェントから Tailscale 経由で届く MCP の道具呼び出しを受け、
+#   ホストPC に USB 接続された RISC-V ボード (当面は Kendryte K210 /
+#   Sipeed Maix Dock) を操作する。
+#
+#   - 入口は最小実装の MCP サーバ (Streamable HTTP, JSON 応答のみ)。
+#     標準ライブラリだけで動く (WSL 側に追加インストールは不要)。
+#     待ち受けは 127.0.0.1 のみ。外からの到達は Windows 側 tailscale serve が担う。
+#   - シリアルポートを実際に開くのは Windows 側の serial_bridge.py で、
+#     Windows 相互運用 (py.exe) で起動し NDJSON パイプでやり取りする。
+#     ポートは開いたまま保持し、受信は裏でログに貯め続ける
+#     (開くたびに DTR/RTS でボードがリセットされ得るのを避けるため)。
+#   - 書き込み (flash) は Windows 側の kflash を py.exe 経由で呼ぶ。
+#
+# 起動:
+#   python3 board_daemon.py [--config config.json] [--port-http 8766]
+#
+# config.json (同ディレクトリ、無ければ既定値):
+#   {"com_port":"COM3","baud":115200,"board":"dan",
+#    "windows_python":"py.exe","reset_line":"rts","reset_pulse_ms":150}
+
+import argparse
+import base64
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+STARTED_AT = time.time()
+
+DEFAULT_CONFIG = {
+    "com_port": "COM3",
+    "baud": 115200,
+    "board": "dan",                # kflash の -B 指定 (Maix Dock)
+    "windows_python": "py.exe",    # Windows 相互運用で呼ぶ Python ランチャ
+    "reset_line": "rts",           # リセットに使う信号線 (dtr/rts)
+    "reset_pulse_ms": 150,
+    "http_host": "127.0.0.1",
+    "http_port": 8766,
+}
+
+
+def load_config(path):
+    cfg = dict(DEFAULT_CONFIG)
+    if path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    return cfg
+
+
+def run_quiet(argv, timeout=20):
+    """コマンドを実行し (returncode, 出力文字列) を返す。失敗しても例外にしない。"""
+    try:
+        p = subprocess.run(argv, capture_output=True, timeout=timeout)
+        out = (p.stdout + p.stderr).decode("utf-8", errors="replace").strip()
+        return p.returncode, out
+    except FileNotFoundError:
+        return None, "not found: %s" % argv[0]
+    except subprocess.TimeoutExpired:
+        return None, "timeout after %ss: %s" % (timeout, argv[0])
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, e)
+
+
+# ---------------------------------------------------------------------------
+# シリアル受信ログ (カーソル式)
+# ---------------------------------------------------------------------------
+
+class SerialLog:
+    """受信バイト列を貯めるバッファ。カーソルは通算バイト位置で、
+    読み出しは差分だけを返す。直近 1MB だけ保持する。"""
+
+    MAX_KEEP = 1024 * 1024
+
+    def __init__(self):
+        self._buf = bytearray()
+        self._base = 0
+        self._lock = threading.Lock()
+
+    def append(self, data):
+        with self._lock:
+            self._buf.extend(data)
+            if len(self._buf) > self.MAX_KEEP:
+                drop = len(self._buf) - self.MAX_KEEP
+                del self._buf[:drop]
+                self._base += drop
+
+    def total(self):
+        with self._lock:
+            return self._base + len(self._buf)
+
+    def read_since(self, cursor):
+        with self._lock:
+            total = self._base + len(self._buf)
+            if cursor is None or cursor < self._base:
+                cursor = self._base
+            if cursor > total:
+                cursor = total
+            data = bytes(self._buf[cursor - self._base:])
+            return data.decode("utf-8", errors="replace"), total
+
+
+# ---------------------------------------------------------------------------
+# Windows 側シリアルブリッジの管理
+# ---------------------------------------------------------------------------
+
+class Bridge:
+    """serial_bridge.py を Windows Python で起動し、保持する。"""
+
+    def __init__(self, cfg, log):
+        self.cfg = cfg
+        self.log = log
+        self.proc = None
+        self.lock = threading.Lock()
+        self.last_error = None
+        self._ready = False
+        self._win_temp = None
+
+    def _windows_temp_wsl(self):
+        """Windows の %TEMP% を WSL パスで返す。"""
+        if self._win_temp:
+            return self._win_temp
+        rc, out = run_quiet(
+            ["powershell.exe", "-NoProfile", "-Command", "$env:TEMP"], timeout=15)
+        if rc != 0 or not out:
+            raise RuntimeError("cannot get Windows TEMP folder: " + out)
+        win_path = out.splitlines()[0].strip()
+        rc, out = run_quiet(["wslpath", "-u", win_path], timeout=10)
+        if rc != 0 or not out:
+            raise RuntimeError("wslpath failed for %s: %s" % (win_path, out))
+        self._win_temp = out.splitlines()[0].strip()
+        return self._win_temp
+
+    def _stage_bridge_script(self):
+        """serial_bridge.py を Windows 側一時フォルダへコピーし Windows パスを返す。
+        WSL のパスをそのまま Windows Python に渡すより確実なため。"""
+        temp_wsl = self._windows_temp_wsl()
+        dest_dir = os.path.join(temp_wsl, "board-daemon")
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, "serial_bridge.py")
+        shutil.copyfile(os.path.join(HERE, "serial_bridge.py"), dest)
+        rc, out = run_quiet(["wslpath", "-w", dest], timeout=10)
+        if rc != 0 or not out:
+            raise RuntimeError("wslpath -w failed: %s" % out)
+        return out.splitlines()[0].strip()
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, port=None, baud=None):
+        with self.lock:
+            if self.alive():
+                return {"attached": True,
+                        "port": port or self.cfg["com_port"],
+                        "baud": baud or self.cfg["baud"],
+                        "note": "already attached"}
+            port = port or self.cfg["com_port"]
+            baud = int(baud or self.cfg["baud"])
+            self._ready = False
+            self.last_error = None
+            script_win = self._stage_bridge_script()
+            argv = [self.cfg["windows_python"], "-u", script_win,
+                    "--port", port, "--baud", str(baud)]
+            try:
+                self.proc = subprocess.Popen(
+                    argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE)
+            except Exception as e:
+                raise RuntimeError("cannot launch Windows python: %s" % e)
+            threading.Thread(target=self._pump_stdout, daemon=True).start()
+            threading.Thread(target=self._pump_stderr, daemon=True).start()
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                if self.last_error:
+                    raise RuntimeError(self.last_error)
+                if self._ready:
+                    return {"attached": True, "port": port, "baud": baud}
+                if not self.alive():
+                    raise RuntimeError("bridge exited early: %s"
+                                       % (self.last_error or "unknown"))
+                time.sleep(0.05)
+            raise RuntimeError("bridge did not become ready in 8s")
+
+    def _pump_stdout(self):
+        try:
+            for raw in self.proc.stdout:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw.decode("utf-8", errors="replace"))
+                except Exception:
+                    continue
+                kind = msg.get("type")
+                if kind == "rx":
+                    try:
+                        self.log.append(base64.b64decode(msg.get("data_b64", "")))
+                    except Exception:
+                        pass
+                elif kind == "ready":
+                    self._ready = True
+                elif kind == "error":
+                    self.last_error = msg.get("message", "bridge error")
+                    print("[bridge] %s" % self.last_error, file=sys.stderr)
+                elif kind == "closed":
+                    self._ready = False
+        except Exception:
+            pass
+
+    def _pump_stderr(self):
+        try:
+            for raw in self.proc.stderr:
+                print("[bridge/stderr] %s"
+                      % raw.decode("utf-8", errors="replace"),
+                      end="", file=sys.stderr)
+        except Exception:
+            pass
+
+    def _send(self, obj):
+        if not self.alive():
+            raise RuntimeError("bridge is not running (call board_attach first)")
+        line = (json.dumps(obj) + "\n").encode("utf-8")
+        self.proc.stdin.write(line)
+        self.proc.stdin.flush()
+
+    def stop(self):
+        with self.lock:
+            if self.proc is not None:
+                try:
+                    self._send({"type": "close"})
+                    self.proc.wait(timeout=3)
+                except Exception:
+                    try:
+                        self.proc.kill()
+                    except Exception:
+                        pass
+                self.proc = None
+                self._ready = False
+            return {"attached": False}
+
+    # -- ブリッジへの操作 ---------------------------------------------------
+
+    def tx_text(self, text):
+        self._send({"type": "tx",
+                    "data_b64": base64.b64encode(
+                        text.encode("utf-8")).decode("ascii")})
+
+    def reset(self, line=None, pulse_ms=None):
+        self._send({"type": "reset",
+                    "line": line or self.cfg["reset_line"],
+                    "pulse_ms": int(pulse_ms or self.cfg["reset_pulse_ms"])})
+
+    def set_lines(self, dtr=None, rts=None):
+        cmd = {"type": "set_lines"}
+        if dtr is not None:
+            cmd["dtr"] = bool(dtr)
+        if rts is not None:
+            cmd["rts"] = bool(rts)
+        self._send(cmd)
+
+
+# ---------------------------------------------------------------------------
+# Windows 側の情報取得 (doctor / serial_list 用)
+# ---------------------------------------------------------------------------
+
+def list_serial_ports(cfg):
+    """COM ポート一覧を Windows 側から取る。
+    Get-PnpDevice の全体スキャンは非常に遅いことがあるので使わず、
+    [SerialPort]::GetPortNames() とレジストリ SERIALCOMM だけで済ませる。"""
+    rc, names = run_quiet(
+        ["powershell.exe", "-NoProfile", "-Command",
+         "[System.IO.Ports.SerialPort]::GetPortNames() -join ','"],
+        timeout=20)
+    ports = []
+    if rc == 0 and names:
+        ports = [p.strip() for p in names.split(",") if p.strip()]
+    rc2, mapping = run_quiet(
+        ["powershell.exe", "-NoProfile", "-Command",
+         "(Get-ItemProperty 'HKLM:\\HARDWARE\\DEVICEMAP\\SERIALCOMM' "
+         "| Out-String)"],
+        timeout=20)
+    return {"ports": ports,
+            "serialcomm_registry": mapping if rc2 == 0 else "",
+            "default_port": cfg["com_port"]}
+
+
+def doctor(cfg, bridge):
+    """環境診断。失敗した項目も落とさず dict で返す。"""
+    rep = {"daemon_uptime_sec": round(time.time() - STARTED_AT, 1),
+           "config": {k: cfg[k] for k in
+                      ("com_port", "baud", "board", "windows_python",
+                       "reset_line", "reset_pulse_ms", "http_port")},
+           "bridge_attached": bridge.alive(),
+           "bridge_last_error": bridge.last_error}
+    rc, out = run_quiet([sys.executable, "--version"], timeout=10)
+    rep["wsl_python"] = out
+    rc, out = run_quiet(
+        ["powershell.exe", "-NoProfile", "-Command", "echo ok"], timeout=20)
+    rep["powershell_interop"] = (out == "ok")
+    py = cfg["windows_python"]
+    rc, out = run_quiet([py, "--version"], timeout=20)
+    rep["windows_python"] = out if rc == 0 else "NOT AVAILABLE: %s" % out
+    if rc == 0:
+        rc2, out2 = run_quiet(
+            [py, "-c", "import serial; print(serial.__version__)"],
+            timeout=20)
+        rep["windows_pyserial"] = out2 if rc2 == 0 else "NOT INSTALLED"
+        rc3, out3 = run_quiet(
+            [py, "-c", "import kflash; print('kflash importable')"],
+            timeout=20)
+        rep["windows_kflash"] = ("available" if rc3 == 0
+                                 else "NOT INSTALLED (pip: py -m pip install kflash)")
+    try:
+        rep["serial_ports"] = list_serial_ports(cfg)
+    except Exception as e:
+        rep["serial_ports"] = {"error": str(e)}
+    return rep
+
+
+# ---------------------------------------------------------------------------
+# 道具 (MCP tools)
+# ---------------------------------------------------------------------------
+
+def make_tools(cfg, bridge, log):
+    """道具名 -> (説明, 引数スキーマ, 実装関数) の表を作る。"""
+
+    def t_doctor(args):
+        return doctor(cfg, bridge)
+
+    def t_serial_list(args):
+        return list_serial_ports(cfg)
+
+    def t_attach(args):
+        return bridge.start(args.get("port"), args.get("baud"))
+
+    def t_detach(args):
+        return bridge.stop()
+
+    def t_status(args):
+        return {"attached": bridge.alive(),
+                "log_bytes_total": log.total(),
+                "last_error": bridge.last_error}
+
+    def t_reset(args):
+        bridge.reset(args.get("line"), args.get("pulse_ms"))
+        return {"reset": True}
+
+    def t_set_lines(args):
+        bridge.set_lines(args.get("dtr"), args.get("rts"))
+        return {"set": True}
+
+    def t_send(args):
+        text = args.get("text", "")
+        if args.get("newline", True):
+            text += args.get("eol", "\n")
+        cur = log.total()
+        bridge.tx_text(text)
+        return {"sent": True, "cursor": cur}
+
+    def t_read(args):
+        text, cur = log.read_since(args.get("cursor"))
+        return {"text": text, "cursor": cur}
+
+    def t_expect(args):
+        import re
+        pattern = args["pattern"]
+        timeout = float(args.get("timeout_ms", 10000)) / 1000.0
+        cursor = args.get("cursor")
+        deadline = time.time() + timeout
+        while True:
+            text, cur = log.read_since(cursor)
+            m = re.search(pattern, text)
+            if m:
+                return {"matched": True, "text": text[:m.end()], "cursor": cur}
+            if time.time() >= deadline:
+                return {"matched": False, "text": text, "cursor": cur}
+            time.sleep(0.05)
+
+    def t_send_expect(args):
+        text = args.get("text", "")
+        if args.get("newline", True):
+            text += args.get("eol", "\n")
+        cur = log.total()
+        bridge.tx_text(text)
+        args2 = dict(args)
+        args2["cursor"] = cur
+        return t_expect(args2)
+
+    def t_boot_log(args):
+        # 起動ログは「パターン待ち」ではなく一定時間まるごと採取する。
+        # (パターン ".*" だと空文字列に即マッチして何も取れないため)
+        wait_ms = int(args.get("wait_ms", 4000))
+        if not bridge.alive():
+            bridge.start()
+        cur = log.total()
+        bridge.reset()
+        pattern = args.get("pattern")
+        if pattern:
+            res = t_expect({"pattern": pattern, "timeout_ms": wait_ms,
+                            "cursor": cur})
+        else:
+            time.sleep(wait_ms / 1000.0)
+            text, cur2 = log.read_since(cur)
+            res = {"matched": len(text) > 0, "text": text, "cursor": cur2}
+        res["boot_log"] = True
+        return res
+
+    # flash の途中経過は last_flash.json に逐次残す。応答が届かない形で
+    # 失敗しても、後から flash_log で「どこまで進んだか」が分かるように。
+    flash_state_path = os.path.join(HERE, "last_flash.json")
+    kflash_out_path = os.path.join(HERE, "last_kflash_output.log")
+
+    def flash_note(state, step, **fields):
+        state["step"] = step
+        state["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        state.update(fields)
+        try:
+            with open(flash_state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def t_flash_log(args):
+        out = {"state": None, "kflash_output_tail": ""}
+        try:
+            with open(flash_state_path, encoding="utf-8") as f:
+                out["state"] = json.load(f)
+        except Exception:
+            pass
+        try:
+            with open(kflash_out_path, "rb") as f:
+                out["kflash_output_tail"] = \
+                    f.read()[-3000:].decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        return out
+
+    def t_flash_kflash(args):
+        state = {"started_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        flash_note(state, "received",
+                   has_file_b64=bool(args.get("file_b64")),
+                   file_path=args.get("file_path"))
+        data_b64 = args.get("file_b64")
+        src = args.get("file_path")
+        if not data_b64 and not src:
+            flash_note(state, "error", error="file_b64 or file_path required")
+            raise RuntimeError("file_b64 or file_path is required")
+        temp_wsl = bridge._windows_temp_wsl()
+        stage_dir = os.path.join(temp_wsl, "board-daemon")
+        os.makedirs(stage_dir, exist_ok=True)
+        local = os.path.join(stage_dir, "firmware.bin")
+        if data_b64:
+            with open(local, "wb") as f:
+                f.write(base64.b64decode(data_b64))
+        else:
+            shutil.copyfile(src, local)
+        size = os.path.getsize(local)
+        flash_note(state, "staged", staged_path_wsl=local, size=size)
+        rc, win = run_quiet(["wslpath", "-w", local], timeout=10)
+        if rc != 0:
+            flash_note(state, "error", error="wslpath -w failed: %s" % win)
+            raise RuntimeError("wslpath -w failed: %s" % win)
+        win_path = win.splitlines()[0].strip()
+        was_attached = bridge.alive()
+        if was_attached:
+            bridge.stop()
+        flash_note(state, "bridge_stopped", was_attached=was_attached)
+        try:
+            argv = [cfg["windows_python"], "-m", "kflash",
+                    "-p", args.get("port", cfg["com_port"]),
+                    "-B", args.get("board", cfg["board"]),
+                    "-b", str(args.get("baud", 115200))]
+            if args.get("sram", True):
+                argv.append("-s")
+            argv.append(win_path)
+            flash_note(state, "kflash_started", argv=argv,
+                       staged_path_win=win_path)
+            # 出力はパイプでなくファイルへ受ける (パイプだと kflash 側の
+            # 残留プロセスに読み取りが引きずられる恐れがあるため)。
+            # stdin は DEVNULL にしてデーモンの端末を継がせない。
+            timeout = float(args.get("timeout_sec", 60))
+            with open(kflash_out_path, "wb") as out_f:
+                proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                        stdout=out_f,
+                                        stderr=subprocess.STDOUT)
+                deadline = time.time() + timeout
+                while proc.poll() is None and time.time() < deadline:
+                    time.sleep(0.2)
+                timed_out = proc.poll() is None
+                if timed_out:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            with open(kflash_out_path, "rb") as f:
+                out_text = f.read().decode("utf-8", errors="replace")
+            flash_note(state, "kflash_timeout" if timed_out else "done",
+                       returncode=proc.returncode, timed_out=timed_out)
+            return {"returncode": proc.returncode, "timed_out": timed_out,
+                    "output_tail": out_text[-3000:],
+                    "staged_path": local, "size": size,
+                    "success_marker_found":
+                        "Boot user code from SRAM" in out_text
+                        or "Burn SRAM OK" in out_text,
+                    "sram": bool(args.get("sram", True))}
+        finally:
+            if was_attached:
+                try:
+                    bridge.start()
+                except Exception:
+                    pass
+
+    obj = {"type": "object"}
+    return {
+        "doctor": ("環境診断 (Windows相互運用・Python・pyserial・kflash・COMポート)",
+                   obj, t_doctor),
+        "serial_list": ("Windows 側の COM ポート一覧", obj, t_serial_list),
+        "board_status": ("ブリッジ接続状態と受信ログ量", obj, t_status),
+        "board_attach": ("シリアルポートを開いて保持する",
+                         {"type": "object", "properties": {
+                             "port": {"type": "string"},
+                             "baud": {"type": "integer"}}}, t_attach),
+        "board_detach": ("シリアルポートを閉じる", obj, t_detach),
+        "board_reset": ("リセット信号をパルスする",
+                        {"type": "object", "properties": {
+                            "line": {"type": "string"},
+                            "pulse_ms": {"type": "integer"}}}, t_reset),
+        "board_set_lines": ("DTR/RTS を直接設定する (ISP 侵入の実験用)",
+                            {"type": "object", "properties": {
+                                "dtr": {"type": "boolean"},
+                                "rts": {"type": "boolean"}}}, t_set_lines),
+        "serial_send": ("シリアルへ文字列を送る (既定で改行付き、eol で変更可。"
+                        "MicroPython REPL の実行は eol='\\r' が要る)",
+                        {"type": "object", "properties": {
+                            "text": {"type": "string"},
+                            "newline": {"type": "boolean"},
+                            "eol": {"type": "string"}},
+                         "required": ["text"]}, t_send),
+        "serial_read": ("受信ログをカーソル以降から読む",
+                        {"type": "object", "properties": {
+                            "cursor": {"type": "integer"}}}, t_read),
+        "serial_expect": ("受信ログに正規表現が現れるまで待つ",
+                          {"type": "object", "properties": {
+                              "pattern": {"type": "string"},
+                              "timeout_ms": {"type": "integer"},
+                              "cursor": {"type": "integer"}},
+                           "required": ["pattern"]}, t_expect),
+        "serial_send_expect": ("送って、応答パターンを待つ (対話の基本形)",
+                               {"type": "object", "properties": {
+                                   "text": {"type": "string"},
+                                   "pattern": {"type": "string"},
+                                   "timeout_ms": {"type": "integer"},
+                                   "newline": {"type": "boolean"},
+                                   "eol": {"type": "string"}},
+                                "required": ["text", "pattern"]},
+                               t_send_expect),
+        "board_boot_log": ("リセットして起動ログを一定時間採取する",
+                           {"type": "object", "properties": {
+                               "wait_ms": {"type": "integer"},
+                               "pattern": {"type": "string"}}}, t_boot_log),
+        "flash_kflash": ("kflash でファームを書く (既定は SRAM ブート=非破壊。"
+                         "途中経過は last_flash.json に残る)",
+                         {"type": "object", "properties": {
+                             "file_b64": {"type": "string"},
+                             "file_path": {"type": "string"},
+                             "port": {"type": "string"},
+                             "board": {"type": "string"},
+                             "baud": {"type": "integer"},
+                             "sram": {"type": "boolean"},
+                             "timeout_sec": {"type": "integer"}}},
+                         t_flash_kflash),
+        "flash_log": ("直近の flash_kflash の途中経過と kflash 出力を読む "
+                      "(応答が届かなかった場合の切り分け用)", obj, t_flash_log),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 最小 MCP サーバ (Streamable HTTP・JSON 応答のみ)
+# ---------------------------------------------------------------------------
+
+class McpServer:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.log = SerialLog()
+        self.bridge = Bridge(cfg, self.log)
+        self.tools = make_tools(cfg, self.bridge, self.log)
+
+    def handle(self, req):
+        """JSON-RPC リクエスト dict を受け、応答 dict か None を返す。"""
+        method = req.get("method", "")
+        rid = req.get("id")
+        params = req.get("params") or {}
+        if method.startswith("notifications/"):
+            return None
+        try:
+            if method == "initialize":
+                result = {
+                    "protocolVersion": params.get("protocolVersion",
+                                                  "2025-03-26"),
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "board-daemon", "version": "0.1.0"},
+                }
+            elif method == "ping":
+                result = {}
+            elif method == "tools/list":
+                result = {"tools": [
+                    {"name": name, "description": desc, "inputSchema": schema}
+                    for name, (desc, schema, _fn) in self.tools.items()]}
+            elif method == "tools/call":
+                name = params.get("name", "")
+                if name not in self.tools:
+                    return self._err(rid, -32602, "unknown tool: %s" % name)
+                fn = self.tools[name][2]
+                try:
+                    out = fn(params.get("arguments") or {})
+                    text = json.dumps(out, ensure_ascii=False)
+                    result = {"content": [{"type": "text", "text": text}],
+                              "isError": False}
+                except Exception as e:
+                    result = {"content": [{"type": "text",
+                                           "text": "error: %s" % e}],
+                              "isError": True}
+            else:
+                return self._err(rid, -32601, "method not found: %s" % method)
+        except Exception as e:
+            return self._err(rid, -32603, "internal error: %s" % e)
+        return {"jsonrpc": "2.0", "id": rid, "result": result}
+
+    @staticmethod
+    def _err(rid, code, message):
+        return {"jsonrpc": "2.0", "id": rid,
+                "error": {"code": code, "message": message}}
+
+
+def make_handler(mcp):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *a):  # アクセスログは標準エラーへ最小限
+            print("[http] %s" % (fmt % a), file=sys.stderr)
+
+        def _reply(self, code, body_bytes, ctype="application/json"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body_bytes)))
+            self.end_headers()
+            if body_bytes:
+                self.wfile.write(body_bytes)
+
+        def do_GET(self):
+            if self.path == "/health":
+                body = json.dumps({
+                    "ok": True, "service": "board-daemon",
+                    "uptime_sec": round(time.time() - STARTED_AT, 1),
+                    "bridge_attached": mcp.bridge.alive()}).encode()
+                self._reply(200, body)
+            else:
+                self._reply(405, b"")
+
+        def do_POST(self):
+            if self.path.split("?")[0] != "/mcp":
+                self._reply(404, b"{}")
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                req = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                self._reply(400, b"{}")
+                return
+            resp = mcp.handle(req)
+            if resp is None:  # notification
+                self._reply(202, b"")
+                return
+            body = json.dumps(resp).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Mcp-Session-Id", uuid.uuid4().hex)
+            self.end_headers()
+            self.wfile.write(body)
+
+    return Handler
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=os.path.join(HERE, "config.json"))
+    ap.add_argument("--port-http", type=int, default=None)
+    args = ap.parse_args()
+    cfg = load_config(args.config)
+    if args.port_http:
+        cfg["http_port"] = args.port_http
+    mcp = McpServer(cfg)
+    server = ThreadingHTTPServer((cfg["http_host"], cfg["http_port"]),
+                                 make_handler(mcp))
+    print("board-daemon listening on %s:%d (POST /mcp, GET /health)"
+          % (cfg["http_host"], cfg["http_port"]), file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

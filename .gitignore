@@ -1,0 +1,4 @@
+__pycache__/
+daemon/config.json
+daemon/last_flash.json
+daemon/last_kflash_output.log
