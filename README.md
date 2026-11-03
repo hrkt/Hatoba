@@ -110,9 +110,11 @@ BOARD_DAEMON_ENDPOINT=http://<ホストPCのtailnet IP>:8766 python3 client/clie
   追加した: `pace_ms` と `chunk` (既定 3 バイト) を指定すると小分けに
   間隔を空けて送る。KosabaOS 向けの実機確認済みレシピは
   `chunk=3, pace_ms=40` (21 文字のコマンドが全量到達)。
-  なお同日、KosabaOS 側の受信が完全に止まる事象も 1 件観測した
-  (echo も戻らない。detach/attach では復旧せず、ボードのリセットで
-  復旧)。こちらはボード側の状態の問題として KosabaOS 側の課題。
+  なお同日、KosabaOS 側で入力を一切受け付けなくなる事象も 1 件観測
+  したが、後の OS 側の切り分けで KosabaOS 自身のバグと判明した
+  (存在しないファイルの exec 失敗時に sepc を進めず、同じ ecall が
+  無限再実行されてシェルが getc に戻らなかった。OS 側で修正済み)。
+  Hatoba・ブリッジ・受信回路は無実。
 
 ## 注意
 
