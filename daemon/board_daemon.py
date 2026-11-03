@@ -249,10 +249,31 @@ class Bridge:
 
     # -- ブリッジへの操作 ---------------------------------------------------
 
-    def tx_text(self, text):
-        self._send({"type": "tx",
-                    "data_b64": base64.b64encode(
-                        text.encode("utf-8")).decode("ascii")})
+    def tx_text(self, text, pace_ms=0, chunk=3):
+        """テキストをブリッジへ送る。pace_ms > 0 のときは chunk バイト
+        ごとに pace_ms だけ間隔を空ける (ペース付き送信)。
+
+        ポーリング式に受信するボードでは、受信 FIFO (K210 UARTHS は
+        8段+1) より速くバーストが届くと溢れた分が捨てられる。
+        小分けに間隔を空けて送ると受信側が追いつけるため全量届く
+        (2026-11-03 実機で確認: 無ペースでは 9 文字で切り捨て、
+        3 バイト/40ms のペース送信では 21 文字全量到達)。
+        戻り値は送ったチャンク数。"""
+        data = text.encode("utf-8")
+        if not pace_ms or pace_ms <= 0:
+            self._send({"type": "tx",
+                        "data_b64": base64.b64encode(data).decode("ascii")})
+            return 1 if data else 0
+        chunk = max(1, int(chunk))
+        n = 0
+        for i in range(0, len(data), chunk):
+            self._send({"type": "tx",
+                        "data_b64": base64.b64encode(
+                            data[i:i + chunk]).decode("ascii")})
+            n += 1
+            if i + chunk < len(data):
+                time.sleep(float(pace_ms) / 1000.0)
+        return n
 
     def reset(self, line=None, pulse_ms=None):
         self._send({"type": "reset",
@@ -363,8 +384,11 @@ def make_tools(cfg, bridge, log):
         if args.get("newline", True):
             text += args.get("eol", "\n")
         cur = log.total()
-        bridge.tx_text(text)
-        return {"sent": True, "cursor": cur}
+        pace_ms = int(args.get("pace_ms", 0) or 0)
+        n = bridge.tx_text(text, pace_ms=pace_ms,
+                           chunk=int(args.get("chunk", 3) or 3))
+        return {"sent": True, "cursor": cur, "chunks": n,
+                "pace_ms": pace_ms}
 
     def t_read(args):
         text, cur = log.read_since(args.get("cursor"))
@@ -390,7 +414,8 @@ def make_tools(cfg, bridge, log):
         if args.get("newline", True):
             text += args.get("eol", "\n")
         cur = log.total()
-        bridge.tx_text(text)
+        bridge.tx_text(text, pace_ms=int(args.get("pace_ms", 0) or 0),
+                       chunk=int(args.get("chunk", 3) or 3))
         args2 = dict(args)
         args2["cursor"] = cur
         return t_expect(args2)
@@ -537,11 +562,17 @@ def make_tools(cfg, bridge, log):
                                 "dtr": {"type": "boolean"},
                                 "rts": {"type": "boolean"}}}, t_set_lines),
         "serial_send": ("シリアルへ文字列を送る (既定で改行付き、eol で変更可。"
-                        "MicroPython REPL の実行は eol='\\r' が要る)",
+                        "MicroPython REPL の実行は eol='\\r' が要る)。"
+                        "pace_ms を付けると chunk バイトごとに間隔を空けて送る。"
+                        "受信 FIFO の小さいポーリング受信のボード (K210 等) では"
+                        "バーストが溢れて末尾が落ちるため、chunk=3 / pace_ms=40 が"
+                        "実機確認済みの目安)",
                         {"type": "object", "properties": {
                             "text": {"type": "string"},
                             "newline": {"type": "boolean"},
-                            "eol": {"type": "string"}},
+                            "eol": {"type": "string"},
+                            "pace_ms": {"type": "integer"},
+                            "chunk": {"type": "integer"}},
                          "required": ["text"]}, t_send),
         "serial_read": ("受信ログをカーソル以降から読む",
                         {"type": "object", "properties": {
@@ -552,13 +583,16 @@ def make_tools(cfg, bridge, log):
                               "timeout_ms": {"type": "integer"},
                               "cursor": {"type": "integer"}},
                            "required": ["pattern"]}, t_expect),
-        "serial_send_expect": ("送って、応答パターンを待つ (対話の基本形)",
+        "serial_send_expect": ("送って、応答パターンを待つ (対話の基本形)。"
+                               "pace_ms / chunk は serial_send と同じペース付き送信",
                                {"type": "object", "properties": {
                                    "text": {"type": "string"},
                                    "pattern": {"type": "string"},
                                    "timeout_ms": {"type": "integer"},
                                    "newline": {"type": "boolean"},
-                                   "eol": {"type": "string"}},
+                                   "eol": {"type": "string"},
+                                   "pace_ms": {"type": "integer"},
+                                   "chunk": {"type": "integer"}},
                                 "required": ["text", "pattern"]},
                                t_send_expect),
         "board_boot_log": ("リセットして起動ログを一定時間採取する",
