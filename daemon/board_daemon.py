@@ -37,6 +37,63 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 STARTED_AT = time.time()
 
+# ---------------------------------------------------------------------------
+# ファイルログ (daemon.log)
+# ---------------------------------------------------------------------------
+# デーモンは WSL 端末で手動起動されるため、落ちたときの traceback は
+# 端末にしか残らなかった (2026-11-06 未明、attach 直後にプロセスごと
+# 落ちる事象が続き、遠隔からは何も見えなかった)。同じフォルダの
+# daemon.log にも時刻つきで残し、次に落ちたら原因が追えるようにする。
+# heartbeat も書くので、「プロセスは生きていたが HTTP が届かなかった」
+# のか「プロセスごと死んだ」のかが後から区別できる。
+
+LOG_PATH = os.path.join(HERE, "daemon.log")
+_log_file = None
+_log_lock = threading.Lock()
+
+
+def log_event(msg):
+    line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+    if _log_file is not None:
+        try:
+            with _log_lock:
+                _log_file.write(line + "\n")
+                _log_file.flush()
+        except Exception:
+            pass
+
+
+def setup_logging():
+    global _log_file
+    import faulthandler
+    import traceback
+    try:
+        _log_file = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+        faulthandler.enable(file=_log_file, all_threads=True)
+    except Exception:
+        _log_file = None
+
+    def _excepthook(etype, value, tb):
+        log_event("FATAL unhandled exception:\n" + "".join(
+            traceback.format_exception(etype, value, tb)))
+
+    sys.excepthook = _excepthook
+
+    def _thread_hook(args):
+        log_event("thread %s died:\n%s" % (
+            args.thread.name,
+            "".join(traceback.format_exception(
+                args.exc_type, args.exc_value, args.exc_traceback))))
+
+    try:
+        threading.excepthook = _thread_hook
+    except Exception:
+        pass
+
 DEFAULT_CONFIG = {
     "com_port": "COM3",
     "baud": 115200,
@@ -294,6 +351,8 @@ class Bridge:
                     self.attached_port = port
                     self.current_port = port
                     self._save_state()
+                    log_event("bridge attached port=%s baud=%d"
+                              % (port, baud))
                     return {"attached": True, "port": port, "baud": baud}
                 if not self.alive():
                     raise RuntimeError("bridge exited early: %s"
@@ -321,7 +380,7 @@ class Bridge:
                     self._ready = True
                 elif kind == "error":
                     self.last_error = msg.get("message", "bridge error")
-                    print("[bridge] %s" % self.last_error, file=sys.stderr)
+                    log_event("[bridge] %s" % self.last_error)
                 elif kind == "closed":
                     self._ready = False
         except Exception:
@@ -357,6 +416,7 @@ class Bridge:
                 self.proc = None
                 self._ready = False
                 self.attached_port = None
+                log_event("bridge detached")
             return {"attached": False}
 
     # -- ブリッジへの操作 ---------------------------------------------------
@@ -471,6 +531,19 @@ def make_tools(cfg, bridge, log):
 
     def t_doctor(args):
         return doctor(cfg, bridge)
+
+    def t_daemon_log(args):
+        tail = int(args.get("tail_bytes", 4000) or 4000)
+        try:
+            with open(LOG_PATH, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - tail))
+                return {"log_tail": f.read().decode("utf-8",
+                                                   errors="replace"),
+                        "log_path": LOG_PATH, "log_bytes": size}
+        except Exception as e:
+            return {"log_tail": "", "error": str(e)}
 
     def t_serial_list(args):
         out = list_serial_ports(cfg)
@@ -675,6 +748,10 @@ def make_tools(cfg, bridge, log):
     return {
         "doctor": ("環境診断 (Windows相互運用・Python・pyserial・kflash・COMポート)",
                    obj, t_doctor),
+        "daemon_log": ("デーモンのファイルログ (daemon.log) の末尾を読む。"
+                       "落ちた/おかしくなったときの切り分け用",
+                       {"type": "object", "properties": {
+                           "tail_bytes": {"type": "integer"}}}, t_daemon_log),
         "serial_list": ("Windows 側の COM ポート一覧 (選択中の current_port つき)",
                         obj, t_serial_list),
         "board_status": ("ブリッジ接続状態・使用中ポート・受信ログ量",
@@ -790,12 +867,14 @@ class McpServer:
                 if name not in self.tools:
                     return self._err(rid, -32602, "unknown tool: %s" % name)
                 fn = self.tools[name][2]
+                log_event("tool %s" % name)
                 try:
                     out = fn(params.get("arguments") or {})
                     text = json.dumps(out, ensure_ascii=False)
                     result = {"content": [{"type": "text", "text": text}],
                               "isError": False}
                 except Exception as e:
+                    log_event("tool %s error: %s" % (name, e))
                     result = {"content": [{"type": "text",
                                            "text": "error: %s" % e}],
                               "isError": True}
@@ -816,7 +895,10 @@ def make_handler(mcp):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, fmt, *a):  # アクセスログは標準エラーへ最小限
-            print("[http] %s" % (fmt % a), file=sys.stderr)
+            try:
+                print("[http] %s" % (fmt % a), file=sys.stderr)
+            except Exception:
+                pass
 
         def _reply(self, code, body_bytes, ctype="application/json"):
             self.send_response(code)
@@ -875,15 +957,31 @@ def main():
         cfg["com_port"] = os.environ["BOARD_DAEMON_COM_PORT"]
     if os.environ.get("BOARD_DAEMON_RESET_LINE"):
         cfg["reset_line"] = os.environ["BOARD_DAEMON_RESET_LINE"]
+    setup_logging()
     mcp = McpServer(cfg)
     server = ThreadingHTTPServer((cfg["http_host"], cfg["http_port"]),
                                  make_handler(mcp))
-    print("board-daemon listening on %s:%d (POST /mcp, GET /health)"
-          % (cfg["http_host"], cfg["http_port"]), file=sys.stderr)
+    log_event("board-daemon listening on %s:%d (POST /mcp, GET /health), "
+              "config port=%s reset_line=%s, state port=%s"
+              % (cfg["http_host"], cfg["http_port"], cfg["com_port"],
+                 cfg["reset_line"], mcp.bridge.current_port))
+
+    def heartbeat():
+        while True:
+            time.sleep(60)
+            log_event("heartbeat uptime=%ds attached=%s port=%s"
+                      % (int(time.time() - STARTED_AT), mcp.bridge.alive(),
+                         mcp.bridge.attached_port))
+
+    threading.Thread(target=heartbeat, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        log_event("serve_forever stopped (KeyboardInterrupt)")
+    except BaseException as e:
+        log_event("FATAL serve_forever died: %r" % (e,))
+        raise
+    log_event("serve_forever exited")
 
 
 if __name__ == "__main__":
