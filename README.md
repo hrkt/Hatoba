@@ -20,7 +20,7 @@ Sipeed Maix Dock (Kendryte K210) で、書き込みは kflash を使う。
 ```
 
 - `daemon/board_daemon.py` — MCP サーバ本体。Python 標準ライブラリのみ。
-  版はファイル冒頭の `VERSION` (現在 0.4.0) で、health と doctor の応答の
+  版はファイル冒頭の `VERSION` (現在 0.4.1) で、health と doctor の応答の
   `version` と起動ログに出る。どの版が動いているか遠隔から確認できる。
   道具: doctor / serial_list / board_status / board_attach・detach・
   reset・set_lines / serial_send・read・expect・send_expect /

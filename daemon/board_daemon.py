@@ -39,8 +39,8 @@ STARTED_AT = time.time()
 
 # デーモンのバージョン。health / doctor / 起動ログに出るので、ThinkPad で
 # どの版が動いているか遠隔から確認できる (2026-11-06 ユーザー提案)。
-# 0.4.0: ウォッチドッグ (watchdog.py) を追加。それ以前は 0.3.0
-VERSION = "0.4.0"
+# 0.4.1: ログの端末ミラーをノンブロッキング化 (凍結対策)。0.4.0 で watchdog 追加
+VERSION = "0.4.1"
 
 # ---------------------------------------------------------------------------
 # ファイルログ (daemon.log)
@@ -56,13 +56,28 @@ LOG_PATH = os.path.join(HERE, "daemon.log")
 _log_file = None
 _log_lock = threading.Lock()
 
+# 端末へのミラーは専用スレッド経由のノンブロッキングにする。
+# 2026-11-06 の実測では、デーモンが約66分間まるごと凍って見えた
+# (プロセスは生存、heartbeat の uptime は連続)。WSL 端末が選択状態
+# (QuickEdit) やスリープで止まると print がブロックし、道具ハンドラ
+# まで巻き込まれて HTTP が無応答化しうる。ファイルへの記録を先に済ませ、
+# 端末ミラーはキューに置くだけ (溢れたら捨てる) にして、本処理を
+# 端末の状態から切り離す。
+import queue as _queue_mod
+_stderr_queue = _queue_mod.Queue(maxsize=1000)
+
+
+def _stderr_writer():
+    while True:
+        line = _stderr_queue.get()
+        try:
+            print(line, file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
 
 def log_event(msg):
     line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
-    try:
-        print(line, file=sys.stderr, flush=True)
-    except Exception:
-        pass
     if _log_file is not None:
         try:
             with _log_lock:
@@ -70,6 +85,10 @@ def log_event(msg):
                 _log_file.flush()
         except Exception:
             pass
+    try:
+        _stderr_queue.put_nowait(line)
+    except Exception:
+        pass
 
 
 def setup_logging():
@@ -98,6 +117,8 @@ def setup_logging():
         threading.excepthook = _thread_hook
     except Exception:
         pass
+    threading.Thread(target=_stderr_writer, daemon=True,
+                     name="stderr-writer").start()
 
 DEFAULT_CONFIG = {
     "com_port": "COM3",
@@ -394,9 +415,12 @@ class Bridge:
     def _pump_stderr(self):
         try:
             for raw in self.proc.stderr:
-                print("[bridge/stderr] %s"
-                      % raw.decode("utf-8", errors="replace"),
-                      end="", file=sys.stderr)
+                try:
+                    _stderr_queue.put_nowait(
+                        "[bridge/stderr] %s" % raw.decode(
+                            "utf-8", errors="replace").rstrip())
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -901,9 +925,9 @@ def make_handler(mcp):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def log_message(self, fmt, *a):  # アクセスログは標準エラーへ最小限
+        def log_message(self, fmt, *a):  # アクセスログはキュー経由 (止まらない)
             try:
-                print("[http] %s" % (fmt % a), file=sys.stderr)
+                _stderr_queue.put_nowait("[http] %s" % (fmt % a))
             except Exception:
                 pass
 
@@ -990,6 +1014,11 @@ def main():
         log_event("FATAL serve_forever died: %r" % (e,))
         raise
     log_event("serve_forever exited")
+    # 通常の終了処理に任せると、stderr writer スレッドが print 中のまま
+    # finalization に入り Fatal Python error (_enter_buffered_busy) の
+    # ダンプを出すことがある (ブリッジで踏んだのと同じ競合)。ログは
+    # 書き込み済みなので、終了処理を飛ばして即座に終わる。
+    os._exit(0)
 
 
 if __name__ == "__main__":
