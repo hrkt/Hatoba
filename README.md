@@ -30,6 +30,19 @@ Sipeed Maix Dock (Kendryte K210) で、書き込みは kflash を使う。
   接続先は環境変数 `BOARD_DAEMON_ENDPOINT` で指定する。
 - シリアルポートは開いたまま保持し、受信は常時ログに貯める
   (開閉のたびにリセットがかかるのを避けるため)。
+- 使う COM ポートは固定ではない。`board_attach` は、明示した port →
+  前回成功したポート (`daemon/port_state.json` に記憶) → config の
+  既定値 → 候補が 1 つだけ → 候補を走査して Maix/K210 らしい応答
+  (MaixPy REPL の `print(6*7)` → `42` 等) があったもの、の順で解決する。
+  USB の抜き差しで COM 番号が動いても追随する。`flash_kflash` も
+  同じ解決を使い、再 attach も同じポートへ戻る。環境変数
+  `BOARD_DAEMON_COM_PORT` / `BOARD_DAEMON_RESET_LINE` でも上書きできる。
+- リセット線も基板ごとに記憶する (`board_attach` の `reset_line`)。
+  Maix Dock でも個体差があり、1 台目は `rts`、2 台目は `dtr` で
+  リセットが掛かる (2026-11-06 実機確認)。
+- 2 ポート出る基板 (K210 + ESP32 の複合基板など) では、K210 側が
+  Hatoba の対象。ESP32 側は REPL プローブに応答しないので自動選択で
+  間違えない (2026-11-06 実機: COM4=K210 / COM5=ESP32)。
 
 ## ホストPC 側のセットアップ (手動)
 

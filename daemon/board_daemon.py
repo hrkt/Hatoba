@@ -113,8 +113,15 @@ class SerialLog:
 # Windows 側シリアルブリッジの管理
 # ---------------------------------------------------------------------------
 
+STATE_PATH = os.path.join(HERE, "port_state.json")
+
+
 class Bridge:
-    """serial_bridge.py を Windows Python で起動し、保持する。"""
+    """serial_bridge.py を Windows Python で起動し、保持する。
+
+    ポートは固定ではない。前回成功したポートとリセット線を
+    port_state.json に覚え、board_attach や flash はそれを再利用する。
+    USB の抜き差しで COM 番号が動いても追随できるようにするため。"""
 
     def __init__(self, cfg, log):
         self.cfg = cfg
@@ -124,6 +131,87 @@ class Bridge:
         self.last_error = None
         self._ready = False
         self._win_temp = None
+        self.attached_port = None
+        self.current_port = cfg["com_port"]
+        self.reset_line = cfg["reset_line"]
+        self._last_port_source = None
+        try:
+            with open(STATE_PATH, encoding="utf-8") as f:
+                st = json.load(f)
+            if st.get("port"):
+                self.current_port = st["port"]
+            if st.get("reset_line"):
+                self.reset_line = st["reset_line"]
+        except Exception:
+            pass
+
+    def _save_state(self):
+        try:
+            with open(STATE_PATH, "w", encoding="utf-8") as f:
+                json.dump({"port": self.current_port,
+                           "reset_line": self.reset_line}, f)
+        except Exception:
+            pass
+
+    def _available_ports(self):
+        """Windows 側の COM ポート名一覧。取れなければ None。"""
+        rc, out = run_quiet(
+            ["powershell.exe", "-NoProfile", "-Command",
+             "[System.IO.Ports.SerialPort]::GetPortNames() -join ','"],
+            timeout=20)
+        if rc != 0:
+            return None
+        return sorted(p.strip() for p in out.split(",") if p.strip())
+
+    def resolve_port(self, requested=None):
+        """使うポートを決める。戻り値は (ポート名, 決め方)。
+        優先順: 明示指定 → 前回成功 (port_state) → config の既定 →
+        候補が1つだけ → 候補を1つずつ試し Maix/K210 らしい応答で判定。
+        どれでも決まらなければ例外 (候補一覧つき)。"""
+        if requested:
+            return requested, "explicit"
+        avail = self._available_ports()
+        if avail:
+            if self.current_port in avail:
+                return self.current_port, "last_used"
+            if self.cfg["com_port"] in avail:
+                return self.cfg["com_port"], "config"
+            if len(avail) == 1:
+                return avail[0], "only_available"
+            for cand in avail:
+                if self._probe(cand):
+                    return cand, "probe"
+            raise RuntimeError(
+                "no Maix/K210-like board answered among %s; "
+                "pass port explicitly to board_attach" % (avail,))
+        return self.current_port, "fallback_no_list"
+
+    def _probe(self, port):
+        """候補ポートを開き、Maix/K210 らしい応答があるか軽く試す。
+        MaixPy REPL に print(6*7) を送って 42 が返れば確定。KosabaOS が
+        走っている場合は tick / プロンプト等の文字列でも判定する。
+        ESP32 等の別デバイスは応答しないので弾かれる (2026-11-06 実機:
+        2ポート基板の COM4=K210 が応答、COM5=ESP32 は無応答)。"""
+        try:
+            self._start_on(port, None)
+        except Exception:
+            return False
+        try:
+            cur = self.log.total()
+            self._send({"type": "tx", "data_b64": base64.b64encode(
+                b"print(6*7)\r").decode("ascii")})
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                text, _ = self.log.read_since(cur)
+                if ("42" in text or "MaixPy" in text or "nish>" in text
+                        or "KosabaOS" in text or "tick " in text):
+                    return True
+                time.sleep(0.1)
+            return False
+        except Exception:
+            return False
+        finally:
+            self.stop()
 
     def _windows_temp_wsl(self):
         """Windows の %TEMP% を WSL パスで返す。"""
@@ -156,14 +244,34 @@ class Bridge:
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, port=None, baud=None):
+    def start(self, port=None, baud=None, reset_line=None):
+        """ポートを解決して attach する。reset_line を渡すと、その基板の
+        リセット線として覚える (基板ごとに違う: 1台目は rts、
+        2台目の Dock は dtr でリセットが掛かることを 2026-11-06 に確認)。"""
+        if reset_line:
+            self.reset_line = reset_line
+            self._save_state()
+        if self.alive():
+            if port is None or port == self.attached_port:
+                return {"attached": True, "port": self.attached_port,
+                        "baud": baud or self.cfg["baud"],
+                        "reset_line": self.reset_line,
+                        "note": "already attached"}
+            self.stop()  # 別のポート指定なら張り替える
+        chosen, source = self.resolve_port(port)
+        self._last_port_source = source
+        res = self._start_on(chosen, baud)
+        res["port_source"] = source
+        res["reset_line"] = self.reset_line
+        return res
+
+    def _start_on(self, port, baud=None):
         with self.lock:
             if self.alive():
                 return {"attached": True,
-                        "port": port or self.cfg["com_port"],
+                        "port": self.attached_port,
                         "baud": baud or self.cfg["baud"],
                         "note": "already attached"}
-            port = port or self.cfg["com_port"]
             baud = int(baud or self.cfg["baud"])
             self._ready = False
             self.last_error = None
@@ -183,6 +291,9 @@ class Bridge:
                 if self.last_error:
                     raise RuntimeError(self.last_error)
                 if self._ready:
+                    self.attached_port = port
+                    self.current_port = port
+                    self._save_state()
                     return {"attached": True, "port": port, "baud": baud}
                 if not self.alive():
                     raise RuntimeError("bridge exited early: %s"
@@ -245,6 +356,7 @@ class Bridge:
                         pass
                 self.proc = None
                 self._ready = False
+                self.attached_port = None
             return {"attached": False}
 
     # -- ブリッジへの操作 ---------------------------------------------------
@@ -277,7 +389,7 @@ class Bridge:
 
     def reset(self, line=None, pulse_ms=None):
         self._send({"type": "reset",
-                    "line": line or self.cfg["reset_line"],
+                    "line": line or self.reset_line,
                     "pulse_ms": int(pulse_ms or self.cfg["reset_pulse_ms"])})
 
     def set_lines(self, dtr=None, rts=None):
@@ -321,7 +433,10 @@ def doctor(cfg, bridge):
                       ("com_port", "baud", "board", "windows_python",
                        "reset_line", "reset_pulse_ms", "http_port")},
            "bridge_attached": bridge.alive(),
-           "bridge_last_error": bridge.last_error}
+           "bridge_last_error": bridge.last_error,
+           "attached_port": bridge.attached_port,
+           "current_port": bridge.current_port,
+           "reset_line": bridge.reset_line}
     rc, out = run_quiet([sys.executable, "--version"], timeout=10)
     rep["wsl_python"] = out
     rc, out = run_quiet(
@@ -358,16 +473,23 @@ def make_tools(cfg, bridge, log):
         return doctor(cfg, bridge)
 
     def t_serial_list(args):
-        return list_serial_ports(cfg)
+        out = list_serial_ports(cfg)
+        out["current_port"] = bridge.current_port
+        out["attached_port"] = bridge.attached_port
+        return out
 
     def t_attach(args):
-        return bridge.start(args.get("port"), args.get("baud"))
+        return bridge.start(args.get("port"), args.get("baud"),
+                            reset_line=args.get("reset_line"))
 
     def t_detach(args):
         return bridge.stop()
 
     def t_status(args):
         return {"attached": bridge.alive(),
+                "port": bridge.attached_port,
+                "current_port": bridge.current_port,
+                "reset_line": bridge.reset_line,
                 "log_bytes_total": log.total(),
                 "last_error": bridge.last_error}
 
@@ -495,13 +617,19 @@ def make_tools(cfg, bridge, log):
             flash_note(state, "error", error="wslpath -w failed: %s" % win)
             raise RuntimeError("wslpath -w failed: %s" % win)
         win_path = win.splitlines()[0].strip()
+        # ポートは attach と同じ解決を使う (明示 > 前回成功 > 走査)。
+        # 選択中のポートを覚えておき、最後の再 attach も同じポートへ戻す。
+        fport, fsource = bridge.resolve_port(args.get("port"))
+        bridge.current_port = fport
+        bridge._save_state()
+        flash_note(state, "port_resolved", port=fport, source=fsource)
         was_attached = bridge.alive()
         if was_attached:
             bridge.stop()
         flash_note(state, "bridge_stopped", was_attached=was_attached)
         try:
             argv = [cfg["windows_python"], "-m", "kflash",
-                    "-p", args.get("port", cfg["com_port"]),
+                    "-p", fport,
                     "-B", args.get("board", cfg["board"]),
                     "-b", str(args.get("baud", 115200))]
             if args.get("sram", True):
@@ -529,6 +657,7 @@ def make_tools(cfg, bridge, log):
             flash_note(state, "kflash_timeout" if timed_out else "done",
                        returncode=proc.returncode, timed_out=timed_out)
             return {"returncode": proc.returncode, "timed_out": timed_out,
+                    "port": fport,
                     "output_tail": out_text[-3000:],
                     "staged_path": local, "size": size,
                     "success_marker_found":
@@ -546,14 +675,23 @@ def make_tools(cfg, bridge, log):
     return {
         "doctor": ("環境診断 (Windows相互運用・Python・pyserial・kflash・COMポート)",
                    obj, t_doctor),
-        "serial_list": ("Windows 側の COM ポート一覧", obj, t_serial_list),
-        "board_status": ("ブリッジ接続状態と受信ログ量", obj, t_status),
-        "board_attach": ("シリアルポートを開いて保持する",
+        "serial_list": ("Windows 側の COM ポート一覧 (選択中の current_port つき)",
+                        obj, t_serial_list),
+        "board_status": ("ブリッジ接続状態・使用中ポート・受信ログ量",
+                         obj, t_status),
+        "board_attach": ("シリアルポートを開いて保持する。port 省略時は"
+                         "前回成功したポート → config の順で解決し、決まらなければ"
+                         "候補を走査して Maix/K210 らしいポートを自動で選ぶ"
+                         "(選んだポートは port_state.json に記憶)。"
+                         "reset_line を渡すとその基板のリセット線として記憶する"
+                         "(基板ごとに違う: Dock 1台目=rts、2台目=dtr)",
                          {"type": "object", "properties": {
                              "port": {"type": "string"},
-                             "baud": {"type": "integer"}}}, t_attach),
+                             "baud": {"type": "integer"},
+                             "reset_line": {"type": "string"}}}, t_attach),
         "board_detach": ("シリアルポートを閉じる", obj, t_detach),
-        "board_reset": ("リセット信号をパルスする",
+        "board_reset": ("リセット信号をパルスする (line 省略時は基板ごとに"
+                        "記憶したリセット線、既定 rts)",
                         {"type": "object", "properties": {
                             "line": {"type": "string"},
                             "pulse_ms": {"type": "integer"}}}, t_reset),
@@ -731,6 +869,12 @@ def main():
     cfg = load_config(args.config)
     if args.port_http:
         cfg["http_port"] = args.port_http
+    # 環境変数は config より優先 (起動時に切り替えたいとき用)。
+    # 通常は board_attach の解決と port_state.json の記憶で足りる。
+    if os.environ.get("BOARD_DAEMON_COM_PORT"):
+        cfg["com_port"] = os.environ["BOARD_DAEMON_COM_PORT"]
+    if os.environ.get("BOARD_DAEMON_RESET_LINE"):
+        cfg["reset_line"] = os.environ["BOARD_DAEMON_RESET_LINE"]
     mcp = McpServer(cfg)
     server = ThreadingHTTPServer((cfg["http_host"], cfg["http_port"]),
                                  make_handler(mcp))
