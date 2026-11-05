@@ -37,6 +37,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 STARTED_AT = time.time()
 
+# デーモンのバージョン。health / doctor / 起動ログに出るので、ThinkPad で
+# どの版が動いているか遠隔から確認できる (2026-11-06 ユーザー提案)。
+# 0.3.0: ポート自動解決・daemon.log・ブリッジ終了競合の修正
+VERSION = "0.3.0"
+
 # ---------------------------------------------------------------------------
 # ファイルログ (daemon.log)
 # ---------------------------------------------------------------------------
@@ -488,7 +493,8 @@ def list_serial_ports(cfg):
 
 def doctor(cfg, bridge):
     """環境診断。失敗した項目も落とさず dict で返す。"""
-    rep = {"daemon_uptime_sec": round(time.time() - STARTED_AT, 1),
+    rep = {"version": VERSION,
+           "daemon_uptime_sec": round(time.time() - STARTED_AT, 1),
            "config": {k: cfg[k] for k in
                       ("com_port", "baud", "board", "windows_python",
                        "reset_line", "reset_pulse_ms", "http_port")},
@@ -854,7 +860,8 @@ class McpServer:
                     "protocolVersion": params.get("protocolVersion",
                                                   "2025-03-26"),
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "board-daemon", "version": "0.1.0"},
+                    "serverInfo": {"name": "board-daemon",
+                                   "version": VERSION},
                 }
             elif method == "ping":
                 result = {}
@@ -912,6 +919,7 @@ def make_handler(mcp):
             if self.path == "/health":
                 body = json.dumps({
                     "ok": True, "service": "board-daemon",
+                    "version": VERSION,
                     "uptime_sec": round(time.time() - STARTED_AT, 1),
                     "bridge_attached": mcp.bridge.alive()}).encode()
                 self._reply(200, body)
@@ -961,9 +969,9 @@ def main():
     mcp = McpServer(cfg)
     server = ThreadingHTTPServer((cfg["http_host"], cfg["http_port"]),
                                  make_handler(mcp))
-    log_event("board-daemon listening on %s:%d (POST /mcp, GET /health), "
+    log_event("board-daemon v%s listening on %s:%d (POST /mcp, GET /health), "
               "config port=%s reset_line=%s, state port=%s"
-              % (cfg["http_host"], cfg["http_port"], cfg["com_port"],
+              % (VERSION, cfg["http_host"], cfg["http_port"], cfg["com_port"],
                  cfg["reset_line"], mcp.bridge.current_port))
 
     def heartbeat():
