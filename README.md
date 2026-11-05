@@ -20,7 +20,7 @@ Sipeed Maix Dock (Kendryte K210) で、書き込みは kflash を使う。
 ```
 
 - `daemon/board_daemon.py` — MCP サーバ本体。Python 標準ライブラリのみ。
-  版はファイル冒頭の `VERSION` (現在 0.3.0) で、health と doctor の応答の
+  版はファイル冒頭の `VERSION` (現在 0.4.0) で、health と doctor の応答の
   `version` と起動ログに出る。どの版が動いているか遠隔から確認できる。
   道具: doctor / serial_list / board_status / board_attach・detach・
   reset・set_lines / serial_send・read・expect・send_expect /
@@ -82,6 +82,18 @@ python3 board_daemon.py
 
 `board-daemon listening on 127.0.0.1:8766` と出れば起動済み。
 現状はこのターミナルを開いたままにする運用 (常駐化は今後)。
+
+ウォッチドッグ版 (推奨): デーモンが落ちたり固まったりしても自動で
+再起動する。health を 10 秒ごとに見て 3 回連続失敗で再起動するので、
+手動起動の代わりにこちらを使う (デーモンの起動も面倒を見る)。
+flash 中でも health は応答するため、正常な書き込みを切ることはない。
+
+```bash
+cd ~/hatoba/daemon
+./run.sh        # watchdog をバックグラウンドで起動。以後はこれだけでよい
+# 止め方: pkill -f watchdog.py (デーモンは止まらない)
+# ログ: watchdog.log (再起動の記録) / daemon.log (デーモン本体、追記式で残る)
+```
 
 ### 4. Tailscale の中継 (PowerShell)
 
