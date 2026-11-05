@@ -25,6 +25,7 @@
 import argparse
 import base64
 import json
+import os
 import sys
 import threading
 import time
@@ -76,45 +77,66 @@ def main():
     stop = threading.Event()
 
     def stdin_loop():
-        """デーモンからの命令を読み、シリアル側へ反映するスレッド。"""
-        for raw in sys.stdin.buffer:
-            raw = raw.strip()
-            if not raw:
-                continue
+        """デーモンからの命令を読み、シリアル側へ反映するスレッド。
+        読みは os.read で行う。sys.stdin.buffer を反復/ readline すると、
+        終了処理のときに別スレッドが BufferedReader のロックを持ったまま
+        になり Fatal Python error (_enter_buffered_busy) を踏むことが
+        あるため (2026-11-06 実機、USB 抜去後のブリッジ終了時)。"""
+        buf = b""
+        while not stop.is_set():
             try:
-                cmd = json.loads(raw.decode("utf-8"))
-            except Exception:
-                continue
-            kind = cmd.get("type")
-            try:
-                if kind == "tx":
-                    ser.write(base64.b64decode(cmd.get("data_b64", "")))
-                elif kind == "reset":
-                    line = cmd.get("line", "rts")
-                    pulse = float(cmd.get("pulse_ms", 150)) / 1000.0
-                    if line == "dtr":
-                        ser.dtr = True
-                        time.sleep(pulse)
-                        ser.dtr = False
-                    else:
-                        ser.rts = True
-                        time.sleep(pulse)
-                        ser.rts = False
-                elif kind == "set_lines":
-                    if "dtr" in cmd:
-                        ser.dtr = bool(cmd["dtr"])
-                    if "rts" in cmd:
-                        ser.rts = bool(cmd["rts"])
-                elif kind == "close":
-                    stop.set()
+                chunk = os.read(0, 4096)
+            except OSError:
+                break
+            if not chunk:  # stdin が閉じられた (デーモン終了)
+                break
+            buf += chunk
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                if handle_line(raw):
                     return
-            except Exception as e:
-                emit({"type": "error", "message": f"command {kind} failed: {e}"})
-        stop.set()  # stdin が閉じたら (デーモン終了) 自分も終わる
+        stop.set()
+
+    def handle_line(raw):
+        """NDJSON 1行を処理する。close なら True を返す。"""
+        raw = raw.strip()
+        if not raw:
+            return False
+        try:
+            cmd = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return False
+        kind = cmd.get("type")
+        try:
+            if kind == "tx":
+                ser.write(base64.b64decode(cmd.get("data_b64", "")))
+            elif kind == "reset":
+                line = cmd.get("line", "rts")
+                pulse = float(cmd.get("pulse_ms", 150)) / 1000.0
+                if line == "dtr":
+                    ser.dtr = True
+                    time.sleep(pulse)
+                    ser.dtr = False
+                else:
+                    ser.rts = True
+                    time.sleep(pulse)
+                    ser.rts = False
+            elif kind == "set_lines":
+                if "dtr" in cmd:
+                    ser.dtr = bool(cmd["dtr"])
+                if "rts" in cmd:
+                    ser.rts = bool(cmd["rts"])
+            elif kind == "close":
+                stop.set()
+                return True
+        except Exception as e:
+            emit({"type": "error", "message": f"command {kind} failed: {e}"})
+        return False
 
     t = threading.Thread(target=stdin_loop, daemon=True)
     t.start()
 
+    read_failed = False
     try:
         while not stop.is_set():
             try:
@@ -122,6 +144,7 @@ def main():
             except Exception as e:
                 # ポートが抜けた等。デーモン側に知らせて終わる。
                 emit({"type": "error", "message": f"serial read failed: {e}"})
+                read_failed = True
                 break
             if data:
                 emit({"type": "rx",
@@ -132,6 +155,12 @@ def main():
         except Exception:
             pass
         emit({"type": "closed"})
+    if read_failed:
+        # 読み失敗時は stdin スレッドがまだ os.read で待っていることが
+        # ある。通常の終了処理 (インタプリタ finalization) に入ると
+        # ブリッジが異常終了のダンプを出すことがあるので、出力は
+        # 送信済みのこの時点で即座に終わる (2026-11-06 実機)。
+        os._exit(1)
     return 0
 
 
