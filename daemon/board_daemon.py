@@ -39,8 +39,22 @@ STARTED_AT = time.time()
 
 # デーモンのバージョン。health / doctor / 起動ログに出るので、ThinkPad で
 # どの版が動いているか遠隔から確認できる (2026-11-06 ユーザー提案)。
-# 0.4.1: ログの端末ミラーをノンブロッキング化 (凍結対策)。0.4.0 で watchdog 追加
-VERSION = "0.4.1"
+# 0.5.0: Linux ネイティブ対応 (Raspberry Pi 等)。0.4.1 でログの端末
+# ミラーをノンブロッキング化、0.4.0 で watchdog 追加
+VERSION = "0.5.0"
+
+
+def host_platform(cfg):
+    """デーモンの動く土台: 'windows' (WSL から Windows 相互運用で
+    py.exe を使う) か 'linux' (Pi 等のネイティブ Linux で python3 を
+    そのまま使う)。cfg['platform'] が 'auto' (既定) なら WSLInterop
+    の有無で判定する。"""
+    p = str(cfg.get("platform") or "auto").lower()
+    if p in ("windows", "linux"):
+        return p
+    if os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop"):
+        return "windows"
+    return "linux"
 
 # ---------------------------------------------------------------------------
 # ファイルログ (daemon.log)
@@ -125,6 +139,7 @@ DEFAULT_CONFIG = {
     "baud": 115200,
     "board": "dan",                # kflash の -B 指定 (Maix Dock)
     "windows_python": "py.exe",    # Windows 相互運用で呼ぶ Python ランチャ
+    "platform": "auto",            # auto / windows / linux (host_platform 参照)
     "reset_line": "rts",           # リセットに使う信号線 (dtr/rts)
     "reset_pulse_ms": 150,
     "http_host": "127.0.0.1",
@@ -199,6 +214,17 @@ class SerialLog:
 STATE_PATH = os.path.join(HERE, "port_state.json")
 
 
+def linux_serial_ports():
+    """Linux ネイティブ時のシリアルデバイス一覧。
+    /dev/serial/by-id (抜き挿しで変わらない安定名) があればそれを優先し、
+    無ければ /dev/ttyUSB* と /dev/ttyACM* を返す。"""
+    import glob as _glob
+    by_id = sorted(_glob.glob("/dev/serial/by-id/*"))
+    if by_id:
+        return by_id
+    return sorted(_glob.glob("/dev/ttyUSB*") + _glob.glob("/dev/ttyACM*"))
+
+
 class Bridge:
     """serial_bridge.py を Windows Python で起動し、保持する。
 
@@ -237,7 +263,10 @@ class Bridge:
             pass
 
     def _available_ports(self):
-        """Windows 側の COM ポート名一覧。取れなければ None。"""
+        """利用可能なポート名一覧。取れなければ None。
+        windows: PowerShell の GetPortNames。linux: by-id / ttyUSB 列挙。"""
+        if host_platform(self.cfg) == "linux":
+            return linux_serial_ports()
         rc, out = run_quiet(
             ["powershell.exe", "-NoProfile", "-Command",
              "[System.IO.Ports.SerialPort]::GetPortNames() -join ','"],
@@ -295,6 +324,26 @@ class Bridge:
             return False
         finally:
             self.stop()
+
+    def host_python(self):
+        """ブリッジや kflash を実行する Python。
+        windows: 相互運用の py.exe。linux: デーモン自身の python
+        (pyserial / kflash はその環境に入っている前提)。"""
+        if host_platform(self.cfg) == "linux":
+            return sys.executable
+        return self.cfg["windows_python"]
+
+    def stage_dir(self):
+        """ファームウェア等を置く作業フォルダ。
+        windows: %TEMP%\\board-daemon (WSL パス)。linux: 自フォルダの
+        flash-stage。どちらも作って返す。"""
+        if host_platform(self.cfg) == "linux":
+            d = os.path.join(HERE, "flash-stage")
+            os.makedirs(d, exist_ok=True)
+            return d
+        d = os.path.join(self._windows_temp_wsl(), "board-daemon")
+        os.makedirs(d, exist_ok=True)
+        return d
 
     def _windows_temp_wsl(self):
         """Windows の %TEMP% を WSL パスで返す。"""
@@ -358,15 +407,24 @@ class Bridge:
             baud = int(baud or self.cfg["baud"])
             self._ready = False
             self.last_error = None
-            script_win = self._stage_bridge_script()
-            argv = [self.cfg["windows_python"], "-u", script_win,
-                    "--port", port, "--baud", str(baud)]
+            if host_platform(self.cfg) == "linux":
+                # ネイティブ Linux: ステージング不要、そのまま自フォルダの
+                # ブリッジを自分の python で起動する (pyserial が必要)。
+                argv = [sys.executable, "-u",
+                        os.path.join(HERE, "serial_bridge.py"),
+                        "--port", port, "--baud", str(baud)]
+                launcher = "python"
+            else:
+                script_win = self._stage_bridge_script()
+                argv = [self.cfg["windows_python"], "-u", script_win,
+                        "--port", port, "--baud", str(baud)]
+                launcher = "Windows python"
             try:
                 self.proc = subprocess.Popen(
                     argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE)
             except Exception as e:
-                raise RuntimeError("cannot launch Windows python: %s" % e)
+                raise RuntimeError("cannot launch %s: %s" % (launcher, e))
             threading.Thread(target=self._pump_stdout, daemon=True).start()
             threading.Thread(target=self._pump_stderr, daemon=True).start()
             deadline = time.time() + 8
@@ -495,9 +553,14 @@ class Bridge:
 # ---------------------------------------------------------------------------
 
 def list_serial_ports(cfg):
-    """COM ポート一覧を Windows 側から取る。
-    Get-PnpDevice の全体スキャンは非常に遅いことがあるので使わず、
-    [SerialPort]::GetPortNames() とレジストリ SERIALCOMM だけで済ませる。"""
+    """ポート一覧をホスト側から取る。
+    windows: [SerialPort]::GetPortNames() とレジストリ SERIALCOMM
+    (Get-PnpDevice の全体スキャンは非常に遅いことがあるので使わない)。
+    linux: /dev/serial/by-id 等の列挙。"""
+    if host_platform(cfg) == "linux":
+        return {"ports": linux_serial_ports(),
+                "platform": "linux",
+                "default_port": cfg["com_port"]}
     rc, names = run_quiet(
         ["powershell.exe", "-NoProfile", "-Command",
          "[System.IO.Ports.SerialPort]::GetPortNames() -join ','"],
@@ -521,30 +584,47 @@ def doctor(cfg, bridge):
            "daemon_uptime_sec": round(time.time() - STARTED_AT, 1),
            "config": {k: cfg[k] for k in
                       ("com_port", "baud", "board", "windows_python",
+                       "platform",
                        "reset_line", "reset_pulse_ms", "http_port")},
            "bridge_attached": bridge.alive(),
            "bridge_last_error": bridge.last_error,
            "attached_port": bridge.attached_port,
            "current_port": bridge.current_port,
            "reset_line": bridge.reset_line}
+    rep["platform"] = host_platform(cfg)
     rc, out = run_quiet([sys.executable, "--version"], timeout=10)
-    rep["wsl_python"] = out
-    rc, out = run_quiet(
-        ["powershell.exe", "-NoProfile", "-Command", "echo ok"], timeout=20)
-    rep["powershell_interop"] = (out == "ok")
-    py = cfg["windows_python"]
-    rc, out = run_quiet([py, "--version"], timeout=20)
-    rep["windows_python"] = out if rc == 0 else "NOT AVAILABLE: %s" % out
-    if rc == 0:
+    rep["python"] = out
+    if rep["platform"] == "linux":
+        py = sys.executable
         rc2, out2 = run_quiet(
             [py, "-c", "import serial; print(serial.__version__)"],
             timeout=20)
-        rep["windows_pyserial"] = out2 if rc2 == 0 else "NOT INSTALLED"
+        rep["pyserial"] = out2 if rc2 == 0 else \
+            "NOT INSTALLED (pip: python3 -m pip install pyserial)"
         rc3, out3 = run_quiet(
             [py, "-c", "import kflash; print('kflash importable')"],
             timeout=20)
-        rep["windows_kflash"] = ("available" if rc3 == 0
-                                 else "NOT INSTALLED (pip: py -m pip install kflash)")
+        rep["kflash"] = ("available" if rc3 == 0
+                         else "NOT INSTALLED (pip: python3 -m pip install kflash)")
+    else:
+        rep["wsl_python"] = rep["python"]
+        rc, out = run_quiet(
+            ["powershell.exe", "-NoProfile", "-Command", "echo ok"],
+            timeout=20)
+        rep["powershell_interop"] = (out == "ok")
+        py = cfg["windows_python"]
+        rc, out = run_quiet([py, "--version"], timeout=20)
+        rep["windows_python"] = out if rc == 0 else "NOT AVAILABLE: %s" % out
+        if rc == 0:
+            rc2, out2 = run_quiet(
+                [py, "-c", "import serial; print(serial.__version__)"],
+                timeout=20)
+            rep["windows_pyserial"] = out2 if rc2 == 0 else "NOT INSTALLED"
+            rc3, out3 = run_quiet(
+                [py, "-c", "import kflash; print('kflash importable')"],
+                timeout=20)
+            rep["windows_kflash"] = ("available" if rc3 == 0
+                                     else "NOT INSTALLED (pip: py -m pip install kflash)")
     try:
         rep["serial_ports"] = list_serial_ports(cfg)
     except Exception as e:
@@ -704,9 +784,7 @@ def make_tools(cfg, bridge, log):
         if not data_b64 and not src:
             flash_note(state, "error", error="file_b64 or file_path required")
             raise RuntimeError("file_b64 or file_path is required")
-        temp_wsl = bridge._windows_temp_wsl()
-        stage_dir = os.path.join(temp_wsl, "board-daemon")
-        os.makedirs(stage_dir, exist_ok=True)
+        stage_dir = bridge.stage_dir()
         local = os.path.join(stage_dir, "firmware.bin")
         if data_b64:
             with open(local, "wb") as f:
@@ -714,12 +792,16 @@ def make_tools(cfg, bridge, log):
         else:
             shutil.copyfile(src, local)
         size = os.path.getsize(local)
-        flash_note(state, "staged", staged_path_wsl=local, size=size)
-        rc, win = run_quiet(["wslpath", "-w", local], timeout=10)
-        if rc != 0:
-            flash_note(state, "error", error="wslpath -w failed: %s" % win)
-            raise RuntimeError("wslpath -w failed: %s" % win)
-        win_path = win.splitlines()[0].strip()
+        flash_note(state, "staged", staged_path=local, size=size)
+        if host_platform(cfg) == "linux":
+            win_path = local  # パス変換なしでそのまま渡せる
+        else:
+            rc, win = run_quiet(["wslpath", "-w", local], timeout=10)
+            if rc != 0:
+                flash_note(state, "error",
+                           error="wslpath -w failed: %s" % win)
+                raise RuntimeError("wslpath -w failed: %s" % win)
+            win_path = win.splitlines()[0].strip()
         # ポートは attach と同じ解決を使う (明示 > 前回成功 > 走査)。
         # 選択中のポートを覚えておき、最後の再 attach も同じポートへ戻す。
         fport, fsource = bridge.resolve_port(args.get("port"))
@@ -731,7 +813,7 @@ def make_tools(cfg, bridge, log):
             bridge.stop()
         flash_note(state, "bridge_stopped", was_attached=was_attached)
         try:
-            argv = [cfg["windows_python"], "-m", "kflash",
+            argv = [bridge.host_python(), "-m", "kflash",
                     "-p", fport,
                     "-B", args.get("board", cfg["board"]),
                     "-b", str(args.get("baud", 115200))]
@@ -776,13 +858,13 @@ def make_tools(cfg, bridge, log):
 
     obj = {"type": "object"}
     return {
-        "doctor": ("環境診断 (Windows相互運用・Python・pyserial・kflash・COMポート)",
+        "doctor": ("環境診断 (platform・Python・pyserial・kflash・ポート)",
                    obj, t_doctor),
         "daemon_log": ("デーモンのファイルログ (daemon.log) の末尾を読む。"
                        "落ちた/おかしくなったときの切り分け用",
                        {"type": "object", "properties": {
                            "tail_bytes": {"type": "integer"}}}, t_daemon_log),
-        "serial_list": ("Windows 側の COM ポート一覧 (選択中の current_port つき)",
+        "serial_list": ("ホスト側のシリアルポート一覧 (選択中の current_port つき)",
                         obj, t_serial_list),
         "board_status": ("ブリッジ接続状態・使用中ポート・受信ログ量",
                          obj, t_status),
@@ -989,13 +1071,16 @@ def main():
         cfg["com_port"] = os.environ["BOARD_DAEMON_COM_PORT"]
     if os.environ.get("BOARD_DAEMON_RESET_LINE"):
         cfg["reset_line"] = os.environ["BOARD_DAEMON_RESET_LINE"]
+    if os.environ.get("BOARD_DAEMON_PLATFORM"):
+        cfg["platform"] = os.environ["BOARD_DAEMON_PLATFORM"]
     setup_logging()
     mcp = McpServer(cfg)
     server = ThreadingHTTPServer((cfg["http_host"], cfg["http_port"]),
                                  make_handler(mcp))
     log_event("board-daemon v%s listening on %s:%d (POST /mcp, GET /health), "
-              "config port=%s reset_line=%s, state port=%s"
-              % (VERSION, cfg["http_host"], cfg["http_port"], cfg["com_port"],
+              "platform=%s, config port=%s reset_line=%s, state port=%s"
+              % (VERSION, cfg["http_host"], cfg["http_port"],
+                 host_platform(cfg), cfg["com_port"],
                  cfg["reset_line"], mcp.bridge.current_port))
 
     def heartbeat():

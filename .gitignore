@@ -4,6 +4,7 @@ daemon/last_flash.json
 daemon/last_kflash_output.log
 daemon/port_state.json
 daemon/daemon.log
+daemon/flash-stage/
 daemon/watchdog.log
 daemon/watchdog.out
 daemon/daemon-console.log

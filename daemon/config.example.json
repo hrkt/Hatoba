@@ -1,1 +1,1 @@
-{"baud":115200,"board":"dan","com_port":"COM3","http_host":"127.0.0.1","http_port":8766,"reset_line":"rts","reset_pulse_ms":150,"windows_python":"py.exe"}
+{"baud":115200,"board":"dan","com_port":"COM3","http_host":"127.0.0.1","http_port":8766,"platform":"auto","reset_line":"rts","reset_pulse_ms":150,"windows_python":"py.exe"}
