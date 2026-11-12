@@ -40,8 +40,15 @@ cp config.example.json config.json   # platform は auto のままでよい
 doctor の `platform` が `linux`、`pyserial` と `kflash` が
 available になっていれば準備完了。
 
+### web ターミナル (簡易版)
+
+デーモンの `GET /terminal` (http://ホスト:8766/terminal) で、ブラウザから
+シリアル入出力できる。デーモンがポートを掴んだまま使えるので、Tera Term
+用に detach する必要がない。Attach / Detach / Reset ボタン、EOL 選択、
+pace 付き送信つき。認証は無いので tailnet 内専用。
+
 - `daemon/board_daemon.py` — MCP サーバ本体。Python 標準ライブラリのみ。
-  版はファイル冒頭の `VERSION` (現在 0.5.0) で、health と doctor の応答の
+  版はファイル冒頭の `VERSION` (現在 0.6.0) で、health と doctor の応答の
   `version` と起動ログに出る。どの版が動いているか遠隔から確認できる。
   道具: doctor / serial_list / board_status / board_attach・detach・
   reset・set_lines / serial_send・read・expect・send_expect /

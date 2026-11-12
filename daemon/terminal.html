@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hatoba Serial Terminal</title>
+<style>
+  body { margin:0; background:#101216; color:#d7dae0; font-family:ui-monospace,Menlo,Consolas,monospace; display:flex; flex-direction:column; height:100dvh; }
+  header { display:flex; gap:.5em; align-items:center; flex-wrap:wrap; padding:.45em .6em; background:#1a1d23; border-bottom:1px solid #2c3038; font-size:13px; }
+  header .dot { width:.7em; height:.7em; border-radius:50%; background:#888; display:inline-block; }
+  header .on { background:#4caf7d; } header .off { background:#b0534f; }
+  button, select, input { font:inherit; font-size:13px; background:#24272f; color:#d7dae0; border:1px solid #3a3f4a; border-radius:6px; padding:.35em .6em; }
+  button:active { background:#333743; }
+  #out { flex:1; overflow-y:auto; white-space:pre-wrap; word-break:break-all; padding:.6em; font-size:13px; line-height:1.45; }
+  form { display:flex; gap:.5em; padding:.5em .6em; background:#1a1d23; border-top:1px solid #2c3038; }
+  form input { flex:1; }
+  footer { padding:.3em .6em; font-size:11px; color:#8a8f99; background:#1a1d23; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span><span id="st">connecting…</span>
+  <button id="bAttach" type="button">Attach</button>
+  <button id="bDetach" type="button">Detach</button>
+  <button id="bReset" type="button">Reset</button>
+  <button id="bClear" type="button">Clear</button>
+  <label>EOL <select id="eol">
+    <option value="&#10;" selected>LF</option>
+    <option value="&#13;">CR</option>
+    <option value="&#13;&#10;">CRLF</option>
+  </select></label>
+  <label><input type="checkbox" id="pace" checked> pace</label>
+</header>
+<div id="out"></div>
+<form id="f">
+  <input id="inp" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="コマンドを入力して Enter (例: ls / help / print(6*7))">
+  <button type="submit">送信</button>
+</form>
+<footer>Hatoba web terminal (簡易版) — tailnet 内専用。デーモンがポートを掴んだまま使えます。テスト中は Muse 側の操作と競合するので一言どうぞ。</footer>
+<script>
+let cursor = null, rpcId = 0;
+const out = document.getElementById('out');
+const st = document.getElementById('st');
+const dot = document.getElementById('dot');
+
+async function rpc(name, args) {
+  const r = await fetch('/mcp', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({jsonrpc:'2.0', id:++rpcId, method:'tools/call',
+      params:{name:name, arguments:args || {}}})});
+  const j = await r.json();
+  if (j.error) throw new Error(j.error.message);
+  const t = j.result.content[0].text;
+  if (j.result.isError) throw new Error(t);
+  return JSON.parse(t);
+}
+function show(text) {
+  const clean = text.replace(/\[[0-9;]*[A-Za-z]/g, '');
+  out.textContent += clean;
+  while (out.textContent.length > 200000) out.textContent = out.textContent.slice(50000);
+  out.scrollTop = out.scrollHeight;
+}
+async function pollStatus() {
+  try {
+    const s = await rpc('board_status');
+    dot.className = 'dot ' + (s.attached ? 'on' : 'off');
+    st.textContent = s.attached ? ('attached: ' + (s.port || '')) :
+      ('detached (current: ' + (s.current_port || '-') + ')');
+    if (cursor === null) cursor = Math.max(0, (s.log_bytes_total || 0) - 4000);
+  } catch (e) { dot.className = 'dot off'; st.textContent = 'daemon unreachable'; }
+}
+async function pollRead() {
+  if (cursor === null) return;
+  try {
+    const r = await rpc('serial_read', {cursor: cursor});
+    cursor = r.cursor;
+    if (r.text) show(r.text);
+  } catch (e) { /* next round */ }
+}
+async function act(name, args) { try { await rpc(name, args); } catch (e) { show('\n[hatoba] ' + e.message + '\n'); } pollStatus(); }
+document.getElementById('bAttach').onclick = () => act('board_attach');
+document.getElementById('bDetach').onclick = () => act('board_detach');
+document.getElementById('bReset').onclick = () => act('board_reset');
+document.getElementById('bClear').onclick = () => { out.textContent = ''; };
+document.getElementById('f').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const inp = document.getElementById('inp');
+  const text = inp.value; inp.value = '';
+  const args = {text: text, eol: document.getElementById('eol').value, newline: true};
+  if (document.getElementById('pace').checked) { args.pace_ms = 40; args.chunk = 3; }
+  await act('serial_send', args);
+};
+(async () => { await pollStatus(); await pollRead();
+  setInterval(pollRead, 300); setInterval(pollStatus, 3000);
+  document.getElementById('inp').focus(); })();
+</script>
+</body>
+</html>

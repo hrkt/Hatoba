@@ -39,9 +39,9 @@ STARTED_AT = time.time()
 
 # デーモンのバージョン。health / doctor / 起動ログに出るので、ThinkPad で
 # どの版が動いているか遠隔から確認できる (2026-11-06 ユーザー提案)。
-# 0.5.0: Linux ネイティブ対応 (Raspberry Pi 等)。0.4.1 でログの端末
+# 0.6.0: web ターミナル簡易版 (GET /terminal)。0.5.0 で Linux ネイティブ対応、0.4.1 でログの端末
 # ミラーをノンブロッキング化、0.4.0 で watchdog 追加
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 
 def host_platform(cfg):
@@ -1022,7 +1022,20 @@ def make_handler(mcp):
                 self.wfile.write(body_bytes)
 
         def do_GET(self):
-            if self.path == "/health":
+            if self.path in ("/terminal", "/"):
+                try:
+                    with open(os.path.join(HERE, "terminal.html"),
+                              "rb") as f:
+                        body = f.read()
+                except Exception:
+                    body = b"terminal.html not found"
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/health":
                 body = json.dumps({
                     "ok": True, "service": "board-daemon",
                     "version": VERSION,
