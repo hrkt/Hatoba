@@ -41,7 +41,7 @@ STARTED_AT = time.time()
 # どの版が動いているか遠隔から確認できる (2026-11-06 ユーザー提案)。
 # 0.6.0: web ターミナル簡易版 (GET /terminal)。0.5.0 で Linux ネイティブ対応、0.4.1 でログの端末
 # ミラーをノンブロッキング化、0.4.0 で watchdog 追加
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 
 def host_platform(cfg):

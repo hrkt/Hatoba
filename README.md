@@ -42,6 +42,21 @@ cp config.example.json config.json   # platform は auto のままでよい
 doctor の `platform` が `linux`、`pyserial` と `kflash` が
 available になっていれば準備完了。
 
+### systemd 常駐化 (Linux)
+
+`./run.sh` の手動起動はホストが再起動すると戻らない。再起動後も自動で
+上がってほしいときは、daemon フォルダで:
+
+```bash
+./install-systemd.sh     # unit を生成して /etc/systemd/system へ配置し enable --now
+./uninstall-systemd.sh   # 取り消し (フォルダ内のログや config には触らない)
+```
+
+unit は watchdog.py を systemd が直接起動する形 (Restart=always)。
+run.sh の watchdog とは併用しないこと (デーモンの取り合いになる)。
+install スクリプトは手動分が動いていると警告する。tailscale serve の
+設定は tailscaled 側に残るので、再起動後も MagicDNS 名経由で届く。
+
 ### web ターミナル (簡易版)
 
 デーモンの `GET /terminal` (http://ホスト:8766/terminal) で、ブラウザから

@@ -1,0 +1,19 @@
+# Hatoba board daemon (watchdog) -- systemd unit template.
+# install-systemd.sh が @USER@ / @DAEMON_DIR@ / @PYTHON@ を実値に置換して
+# /etc/systemd/system/hatoba.service へ配置する。手で直接置かないこと。
+[Unit]
+Description=Hatoba board daemon (watchdog)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DAEMON_DIR@
+ExecStart=@PYTHON@ @DAEMON_DIR@/watchdog.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
