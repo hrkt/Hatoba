@@ -30,8 +30,10 @@ Linux ではブリッジも kflash もデーモン自身の python3 で直接動
 sudo apt install -y python3 python3-pip
 python3 -m pip install --user pyserial kflash   # ブリッジと書き込み用
 sudo usermod -aG dialout $USER                  # シリアル権限 (再ログインで有効)
-# Tailscale を入れてログインし、Windows と同じ要領で中継する:
-#   tailscale serve --bg 8766  (もしくは http_host を tailnet IP に向ける)
+# Tailscale を入れてログインし、中継する (デーモンは 127.0.0.1 待ち受けなので必須):
+#   sudo tailscale serve --bg --http=8766 http://127.0.0.1:8766
+# 到達は MagicDNS 名 (例 raspi2b.XXXX.ts.net:8766) 経由で行う。
+# tailnet の生 IP で叩くと serve が 404 を返すので、IP ではなく名前を使う。
 cd ~/board-daemon/daemon
 cp config.example.json config.json   # platform は auto のままでよい
 ./run.sh                             # ウォッチドッグ経由で起動
