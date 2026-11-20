@@ -57,6 +57,15 @@ run.sh の watchdog とは併用しないこと (デーモンの取り合いに�
 install スクリプトは手動分が動いていると警告する。tailscale serve の
 設定は tailscaled 側に残るので、再起動後も MagicDNS 名経由で届く。
 
+### ファイル転送 (file_push)
+
+基板の SD カードへ、シリアル経由でファイルを送る MCP ツール (0.8.0〜)。
+受け側は KosabaOS のユーザープログラム RECV.ELF で、SD に入れておく。
+プロトコルは Kermit の芯だけ: SOH/ETX + seq + len(最大1024) + payload +
+CRC-16/CCITT-FALSE、ACK/NAK による stop-and-wait、完了時にサイズと
+FNV-1a-64 を照合する。転送ループはデーモン内で回るので、ブロックごとに
+ネットワークを往復しない。115200 baud で実効 9〜10KB/s 程度。
+
 ### web ターミナル (簡易版)
 
 デーモンの `GET /terminal` (http://ホスト:8766/terminal) で、ブラウザから

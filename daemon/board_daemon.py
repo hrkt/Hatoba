@@ -41,7 +41,7 @@ STARTED_AT = time.time()
 # どの版が動いているか遠隔から確認できる (2026-11-06 ユーザー提案)。
 # 0.6.0: web ターミナル簡易版 (GET /terminal)。0.5.0 で Linux ネイティブ対応、0.4.1 でログの端末
 # ミラーをノンブロッキング化、0.4.0 で watchdog 追加
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 
 def host_platform(cfg):
@@ -196,15 +196,18 @@ class SerialLog:
         with self._lock:
             return self._base + len(self._buf)
 
-    def read_since(self, cursor):
+    def read_bytes_since(self, cursor):
         with self._lock:
             total = self._base + len(self._buf)
             if cursor is None or cursor < self._base:
                 cursor = self._base
             if cursor > total:
                 cursor = total
-            data = bytes(self._buf[cursor - self._base:])
-            return data.decode("utf-8", errors="replace"), total
+            return bytes(self._buf[cursor - self._base:]), total
+
+    def read_since(self, cursor):
+        data, total = self.read_bytes_since(cursor)
+        return data.decode("utf-8", errors="replace"), total
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +537,13 @@ class Bridge:
                 time.sleep(float(pace_ms) / 1000.0)
         return n
 
+    def tx_bytes(self, data):
+        """生バイトをブリッジへ送る (file_push のフレーム送信用)。"""
+        if data:
+            self._send({"type": "tx",
+                        "data_b64": base64.b64encode(
+                            bytes(data)).decode("ascii")})
+
     def reset(self, line=None, pulse_ms=None):
         self._send({"type": "reset",
                     "line": line or self.reset_line,
@@ -635,6 +645,41 @@ def doctor(cfg, bridge):
 # ---------------------------------------------------------------------------
 # 道具 (MCP tools)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# file_push 用プロトコル (RECV.ELF との共通仕様、2026-11-20 に両チャットで確定)
+# フレーム: start(1B) + seq(1B) + len(2B LE) + payload + CRC(2B LE)
+#   start = 0x01 (SOH, データ) / 0x03 (ETX, 終了・len=0)
+#   CRC は CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, 反射なし) を
+#   seq+len+payload に対して計算する。検算値: "123456789" -> 0x29B1
+# 応答: ACK = 0x06 + seq / NAK = 0x15 + 期待 seq
+# 完了照合: FNV-1a-64
+# ---------------------------------------------------------------------------
+
+def crc16_ccitt(data, crc=0xFFFF):
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
+def fnv1a_64(data):
+    h = 0xCBF29CE484222325
+    for b in data:
+        h ^= b
+        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def build_frame(start, seq, payload):
+    hdr = bytes([seq & 0xFF]) + len(payload).to_bytes(2, "little")
+    crc = crc16_ccitt(hdr + payload)
+    return bytes([start]) + hdr + payload + crc.to_bytes(2, "little")
+
 
 def make_tools(cfg, bridge, log):
     """道具名 -> (説明, 引数スキーマ, 実装関数) の表を作る。"""
@@ -856,6 +901,152 @@ def make_tools(cfg, bridge, log):
                 except Exception:
                     pass
 
+    def t_file_push(args):
+        """RECV.ELF へ stop-and-wait でファイルを送る (共通仕様は
+        crc16_ccitt の上のコメント参照)。ループはデーモン内で回すので、
+        ブロックごとにネットワークを往復しない。"""
+        import re
+        if args.get("data_b64") is not None:
+            data = base64.b64decode(args["data_b64"])
+        elif args.get("file_path"):
+            with open(args["file_path"], "rb") as f:
+                data = f.read()
+        else:
+            raise RuntimeError("data_b64 or file_path is required")
+        name = args.get("name", "")
+        if (not name or len(name) > 64
+                or any(c in name for c in " \t\r\n\"'/\\")):
+            raise RuntimeError("invalid name: %r" % (name,))
+        if not bridge.alive():
+            raise RuntimeError(
+                "bridge is not running (call board_attach first)")
+        block_size = int(args.get("block_size", 1024) or 1024)
+        block_size = max(1, min(block_size, 1024))
+        ack_timeout = float(args.get("ack_timeout_ms", 2000)) / 1000.0
+        max_retries = int(args.get("max_retries", 10))
+        ready_timeout = float(args.get("ready_timeout_ms", 20000)) / 1000.0
+
+        started = time.time()
+        cursor = log.total()
+        bridge.tx_text("run /sd/RECV.ELF %s\n" % name, pace_ms=40, chunk=3)
+
+        # --- RECV1 READY を待つ ---
+        buf = b""
+        deadline = time.time() + ready_timeout
+        while b"RECV1 READY" not in buf:
+            chunk, cursor = log.read_bytes_since(cursor)
+            buf += chunk
+            if time.time() >= deadline:
+                tail = buf[-400:].decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    "RECV1 READY not seen within %.0fs; board said: %r"
+                    % (ready_timeout, tail))
+            if not chunk:
+                time.sleep(0.02)
+        idx = buf.index(b"RECV1 READY") + len(b"RECV1 READY")
+        pending = bytearray(buf[idx:])
+
+        # --- 応答 (ACK/NAK) の読み取り ---
+        def wait_response(timeout):
+            """pending と新規受信バイトから ACK/NAK を1つ取り出す。
+            戻り値: ("ack"|"nak", seq) / (None, None) はタイムアウト。
+            ACK/NAK 以外のバイト (tick 等のコンソール出力) は読み捨てる。"""
+            nonlocal cursor
+            deadline = time.time() + timeout
+            while True:
+                while len(pending) >= 2:
+                    b = pending[0]
+                    if b == 0x06 or b == 0x15:
+                        s = pending[1]
+                        del pending[:2]
+                        return ("ack" if b == 0x06 else "nak"), s
+                    del pending[0]
+                if time.time() >= deadline:
+                    return None, None
+                chunk, cursor = log.read_bytes_since(cursor)
+                if chunk:
+                    pending.extend(chunk)
+                else:
+                    time.sleep(0.01)
+        # --- データブロックの stop-and-wait ---
+        retransmits = 0
+        seq = 0
+        blocks = (len(data) + block_size - 1) // block_size
+        for blk in range(blocks):
+            payload = data[blk * block_size:(blk + 1) * block_size]
+            frame = build_frame(0x01, seq, payload)
+            resends = 0
+            advanced = False
+            while not advanced:
+                bridge.tx_bytes(frame)
+                deadline = time.time() + ack_timeout
+                while True:
+                    kind, s = wait_response(
+                        max(0.0, deadline - time.time()))
+                    if kind is None:
+                        break  # タイムアウト → 再送
+                    if kind == "ack" and s == seq:
+                        advanced = True
+                        break
+                    if kind == "nak" and s == ((seq + 1) & 0xFF):
+                        advanced = True  # 相手は既にこのブロックを持っている
+                        break
+                    if kind == "nak" and s == seq:
+                        break  # 即再送
+                    # ack(seq-1) 等の遅延応答は読み捨てて待ち続ける
+                if not advanced:
+                    resends += 1
+                    retransmits += 1
+                    if resends > max_retries:
+                        raise RuntimeError(
+                            "file_push: block %d (seq %d) not ACKed after "
+                            "%d retries" % (blk, seq, max_retries))
+            seq = (seq + 1) & 0xFF
+        # --- 終了フレームと DONE 照合 ---
+        end_frame = build_frame(0x03, seq, b"")
+        done_re = re.compile(rb"RECV1 DONE size=(\d+) fnv=([0-9a-fA-F]{16})")
+        tail = bytes(pending)
+        board_size = None
+        board_fnv = None
+        attempts = 0
+        deadline_all = time.time() + 15.0
+        while board_size is None:
+            bridge.tx_bytes(end_frame)
+            attempts += 1
+            deadline = min(deadline_all, time.time() + 5.0)
+            resent = False
+            while time.time() < deadline:
+                m = done_re.search(tail)
+                if m:
+                    board_size = int(m.group(1))
+                    board_fnv = m.group(2).decode("ascii").lower()
+                    break
+                nak_at = tail.find(b"\x15" + bytes([seq]))
+                if nak_at >= 0 and attempts < 3:
+                    tail = tail[nak_at + 2:]
+                    resent = True
+                    break  # 終了フレームを再送する
+                chunk, cursor = log.read_bytes_since(cursor)
+                if chunk:
+                    tail += chunk
+                else:
+                    time.sleep(0.02)
+            if board_size is None and not resent:
+                if attempts >= 3 or time.time() >= deadline_all:
+                    raise RuntimeError(
+                        "file_push: RECV1 DONE not seen (attempts=%d)"
+                        % attempts)
+        local_fnv = fnv1a_64(data)
+        if board_size != len(data) or board_fnv != "%016x" % local_fnv:
+            raise RuntimeError(
+                "file_push: verify mismatch: board size=%s fnv=%s, "
+                "local size=%d fnv=%016x"
+                % (board_size, board_fnv, len(data), local_fnv))
+        return {"ok": True, "name": name, "bytes": len(data),
+                "blocks": blocks, "retransmits": retransmits,
+                "elapsed_sec": round(time.time() - started, 2),
+                "board_size": board_size,
+                "fnv": "%016x" % local_fnv}
     obj = {"type": "object"}
     return {
         "doctor": ("環境診断 (platform・Python・pyserial・kflash・ポート)",
@@ -939,6 +1130,19 @@ def make_tools(cfg, bridge, log):
                          t_flash_kflash),
         "flash_log": ("直近の flash_kflash の途中経過と kflash 出力を読む "
                       "(応答が届かなかった場合の切り分け用)", obj, t_flash_log),
+        "file_push": ("RECV.ELF へファイルをシリアル転送する (stop-and-wait、"
+                      "CRC-16/CCITT + FNV-1a-64 照合)。基板で RECV.ELF が "
+                      "SD に入っていて Nish のプロンプトにいることが前提。"
+                      "転送ループはデーモン内で回る",
+                      {"type": "object", "properties": {
+                          "name": {"type": "string"},
+                          "data_b64": {"type": "string"},
+                          "file_path": {"type": "string"},
+                          "block_size": {"type": "integer"},
+                          "ack_timeout_ms": {"type": "integer"},
+                          "max_retries": {"type": "integer"},
+                          "ready_timeout_ms": {"type": "integer"}},
+                       "required": ["name"]}, t_file_push),
     }
 
 
