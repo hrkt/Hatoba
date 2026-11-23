@@ -20,9 +20,14 @@
 # the software-recoverable cases and gathers evidence for the rest.
 #
 # Install (on the Pi; files arrive with git pull in ~/myos/Hatoba):
-#   sudo systemctl enable --now \
-#     /home/hiroki/myos/Hatoba/daemon/pi-net-watchdog.timer
+#   sudo ln -sf /home/hiroki/myos/Hatoba/daemon/pi-net-watchdog.service \
+#               /home/hiroki/myos/Hatoba/daemon/pi-net-watchdog.timer \
+#               /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pi-net-watchdog.timer
 #   tail -f ~/myos/Hatoba/daemon/net-watchdog.log
+# (Enabling the timer by path alone fails: the service it triggers is
+# not in systemd's search path. Symlink BOTH units, as above.)
 # Go live: remove the Environment=NET_WATCHDOG_DRY_RUN line from
 # pi-net-watchdog.service, then
 #   sudo systemctl daemon-reload

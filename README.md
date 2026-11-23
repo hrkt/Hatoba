@@ -72,8 +72,10 @@ Pi 自体がネットワークから落ちる事象への対策 (Pi 側の syste
 5分ごとに daemon の /health とネットワークを確認し、tailscaled 再起動 →
 Wi-Fi の link down/up → ドングルの USB 再列挙 (authorized 0→1) → 再起動
 (両方落ちているときだけ) と段階的に復旧を試み、落ちた瞬間の USB/リンク/
-カーネルログを net-watchdog.log に残す。導入は
-`sudo systemctl enable --now ~/myos/Hatoba/daemon/pi-net-watchdog.timer`。
+カーネルログを net-watchdog.log に残す。導入は service と timer の両方を
+/etc/systemd/system/ へ symlink してから
+`sudo systemctl enable --now pi-net-watchdog.timer`
+(timer だけをパス指定で enable すると、相方の service が見つからず起動に失敗する)。
 unit には最初ドライラン (NET_WATCHDOG_DRY_RUN=1) が入っているので、
 本番化はその行を外して daemon-reload。なお USB の電源自体は落とせない
 ため、ドングルが電気的に固まった場合は電源の抜き差しが要る。
