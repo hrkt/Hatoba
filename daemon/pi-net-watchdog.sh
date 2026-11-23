@@ -28,10 +28,9 @@
 #   tail -f ~/myos/Hatoba/daemon/net-watchdog.log
 # (Enabling the timer by path alone fails: the service it triggers is
 # not in systemd's search path. Symlink BOTH units, as above.)
-# Go live: remove the Environment=NET_WATCHDOG_DRY_RUN line from
-# pi-net-watchdog.service, then
-#   sudo systemctl daemon-reload
-#   sudo systemctl restart pi-net-watchdog.timer
+# Status: LIVE since 2026-11-24 (dry-run removed with user approval).
+# Back to dry-run: add Environment=NET_WATCHDOG_DRY_RUN=1 to the
+# .service, then daemon-reload + restart the timer.
 # Sudo: the unit runs as User=hiroki with no TTY and the script sudoes
 # for systemctl / ip / tee / reboot, so install the scoped NOPASSWD
 # entry that ships next to this script (pi-net-watchdog.sudoers):
