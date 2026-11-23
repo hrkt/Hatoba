@@ -1,0 +1,13 @@
+# pi-net-watchdog.sudoers -- passwordless sudo for the watchdog only.
+# The watchdog unit runs as User=hiroki with no TTY, so its sudo calls
+# (systemctl restart tailscaled / ip link set / tee to the dongle's
+# authorized file / reboot) need a scoped NOPASSWD entry, or they fail
+# silently when the timer fires unattended.
+# Install on the Pi:
+#   sudo cp ~/myos/Hatoba/daemon/pi-net-watchdog.sudoers \
+#           /etc/sudoers.d/hatoba-net-watchdog
+#   sudo chmod 440 /etc/sudoers.d/hatoba-net-watchdog
+#   sudo visudo -cf /etc/sudoers.d/hatoba-net-watchdog
+# Paths are Debian bookworm (merged-usr) standard; check with
+# `command -v systemctl ip tee reboot` if a live run still fails.
+hiroki ALL=(root) NOPASSWD: /usr/bin/systemctl restart tailscaled, /usr/sbin/ip link set *, /usr/bin/tee /sys/devices/*, /usr/sbin/reboot

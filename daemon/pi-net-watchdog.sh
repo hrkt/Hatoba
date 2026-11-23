@@ -32,9 +32,10 @@
 # pi-net-watchdog.service, then
 #   sudo systemctl daemon-reload
 #   sudo systemctl restart pi-net-watchdog.timer
-# Sudo: the unit runs as User=hiroki and the script sudoes for
-# systemctl / ip / tee / reboot. Check `sudo -n true` on the Pi; if
-# it needs a password, add a scoped /etc/sudoers.d entry.
+# Sudo: the unit runs as User=hiroki with no TTY and the script sudoes
+# for systemctl / ip / tee / reboot, so install the scoped NOPASSWD
+# entry that ships next to this script (pi-net-watchdog.sudoers):
+#   sudo cp pi-net-watchdog.sudoers /etc/sudoers.d/hatoba-net-watchdog
 #
 # Safety notes:
 # - Interface is detected from the default route, never hardcoded
