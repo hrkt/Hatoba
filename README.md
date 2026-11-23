@@ -66,6 +66,18 @@ CRC-16/CCITT-FALSE、ACK/NAK による stop-and-wait、完了時にサイズと
 FNV-1a-64 を照合する。転送ループはデーモン内で回るので、ブロックごとに
 ネットワークを往復しない。115200 baud で実効 9〜10KB/s 程度。
 
+### Pi のネットワーク自動復旧 (pi-net-watchdog、任意)
+
+Pi 自体がネットワークから落ちる事象への対策 (Pi 側の systemd timer)。
+5分ごとに daemon の /health とネットワークを確認し、tailscaled 再起動 →
+Wi-Fi の link down/up → ドングルの USB 再列挙 (authorized 0→1) → 再起動
+(両方落ちているときだけ) と段階的に復旧を試み、落ちた瞬間の USB/リンク/
+カーネルログを net-watchdog.log に残す。導入は
+`sudo systemctl enable --now ~/myos/Hatoba/daemon/pi-net-watchdog.timer`。
+unit には最初ドライラン (NET_WATCHDOG_DRY_RUN=1) が入っているので、
+本番化はその行を外して daemon-reload。なお USB の電源自体は落とせない
+ため、ドングルが電気的に固まった場合は電源の抜き差しが要る。
+
 ### web ターミナル (簡易版)
 
 デーモンの `GET /terminal` (http://ホスト:8766/terminal) で、ブラウザから

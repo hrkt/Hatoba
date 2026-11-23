@@ -1,0 +1,12 @@
+# pi-net-watchdog.service -- runs the check script once per timer tick
+[Unit]
+Description=Hatoba Pi network watchdog (one check)
+After=network-online.target tailscaled.service
+
+[Service]
+Type=oneshot
+User=hiroki
+# DRY-RUN at first (user decision 2026-11-24): log actions, do nothing.
+# Remove this line to go live, then daemon-reload + restart the timer.
+Environment=NET_WATCHDOG_DRY_RUN=1
+ExecStart=/bin/sh /home/hiroki/myos/Hatoba/daemon/pi-net-watchdog.sh
